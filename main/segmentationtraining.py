@@ -23,16 +23,18 @@ Net=None
 batch_size=1
 optimizer=None 
 logFilePath=None
+seed=41
 
 def set_seed(s=41):
-	
-    torch.manual_seed(s)
-    torch.cuda.manual_seed_all(s)
-    #torch.backends.cudnn.deterministic = True
-    #torch.backends.cudnn.benchmark = False
-    np.random.seed(s)
+	global seed
+	seed=s
+	torch.manual_seed(s)
+	torch.cuda.manual_seed_all(s)
+	#torch.backends.cudnn.deterministic = True
+	#torch.backends.cudnn.benchmark = False
+	np.random.seed(s)
     #random.seed(s)
-    os.environ['PYTHONHASHSEED'] = str(s)
+	os.environ['PYTHONHASHSEED'] = str(s)
 
 
 tensorise=tf.ToTensor()
@@ -1087,7 +1089,7 @@ def trainingDetails(folder,train, batches, val, vbatches, test, tbatches, start,
 	t=datetime.now()
 	DateTime =str(t.hour)+str(t.minute)+"-"+str(t.day)+"-"+str(t.month)+"-"+str(t.year)
 	
-	f = open(folder+'training details'+time+'.txt', 'a')
+	f = open('./'+folder+'/training details '+DateTime+'.txt', 'a')
 	
 	if finished==False:
 		f.write('Date Time: ')
@@ -1101,7 +1103,7 @@ def trainingDetails(folder,train, batches, val, vbatches, test, tbatches, start,
 		f.write('Val: '+str(val)+'  Batches: '+str(vbatches)+'\n')
 		f.write('Test: '+str(val)+'  Batches: '+str(tbatches)+'\n')
 		f.write('Size of tiles: Height'+str(height)+' Width:'+str(width)+'\n')
-		f.write('Batch Size: '+batch_size+'\n')
+		f.write('Batch Size: '+str(batch_size)+'\n')
 		f.write('Name of machine:'+  str(os.environ['COMPUTERNAME']) +'\n')
 		f.write('Username:'+ str( os.environ.get('USERNAME'))+ '\n')
 		f.write('Start from epoch: '+str(start)+'\n')
