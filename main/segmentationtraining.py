@@ -212,7 +212,7 @@ def trainStart(model, TrainFolder, ValidFolder,epochs, batchSize,TestFolder=None
 		log_path=logName
 
 	if not os.path.exists(log_path):
-		log_path2="./"+path+'/LOG for '+path+'.csv'
+		log_path2="./"+path+'/LOG for '+model_naming_title+"-"+DateTime+'.csv'
 		log_titles=['Epoch','Train-Loss','Val-Loss', 'Val-Acc', 'Test-Loss','Test-Acc', 'Time','Learn-Rate','Session','CheckPoint']
 		log_DB=pd.DataFrame( columns=log_titles)
 		log_DB2=pd.DataFrame( columns=log_titles)
@@ -420,6 +420,9 @@ def trainFromLast(model, TrainFolder, ValidFolder, epochs, batchSize, TestFolder
 		log_DB=pd.read_csv(log_path, sep=",", index_col=0)
 		path=log_DB.tail(1)['Session']
 		path=str(path[0])
+		
+		log_path2="./"+path+'/LOG for '+path[7:]+'.csv'
+		
 		best_loss=log_DB['Train-Loss'].min() #smallest loss value
 		LastEpoch=int(log_DB.tail(1)['Epoch'])
 		LastCheckpoint=log_DB.tail(1)['CheckPoint']
@@ -456,9 +459,10 @@ def trainFromLast(model, TrainFolder, ValidFolder, epochs, batchSize, TestFolder
 	Net.load_state_dict(torch.load(checkpoint))  #if this gives an error check the training setup in previous 2 cells
 	optimizer=torch.optim.Adam(params=Net.parameters(),lr=Learning_Rate) # Create adam optimizer
 	scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
-            
+    
+	
 	model_naming_title="-"+model_naming_title+".torch"
-	log_path2="./"+path+'/LOG for '+path+'.csv'
+	#log_path2="./"+path+'/LOG for '+path+'.csv'
 	log_DB2=pd.read_csv(log_path2, sep=",", index_col=0)
             
 	unbatched=len(ListImages)%batch_size
@@ -1101,7 +1105,7 @@ def trainingDetails(folder,train, batches, val, vbatches, test, tbatches, start,
 		f.write('Seed: '+str(seed)+'\n')
 		f.write('Train: '+str(train)+'  Batches: '+str(batches)+'\n')
 		f.write('Val: '+str(val)+'  Batches: '+str(vbatches)+'\n')
-		f.write('Test: '+str(val)+'  Batches: '+str(tbatches)+'\n')
+		f.write('Test: '+str(test)+'  Batches: '+str(tbatches)+'\n')
 		f.write('Size of tiles: Height'+str(height)+' Width:'+str(width)+'\n')
 		f.write('Batch Size: '+str(batch_size)+'\n')
 		f.write('Name of machine:'+  str(os.environ['COMPUTERNAME']) +'\n')
