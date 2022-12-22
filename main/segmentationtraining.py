@@ -1,0 +1,1336 @@
+from datetime import datetime
+import os
+from pathlib import Path
+import numpy as np
+import copy
+import cv2
+from tqdm import tqdm
+import gc
+from torch import cuda
+import pandas as pd
+
+import torch
+import torchvision.transforms as tf
+import segmentation_models_pytorch as smp
+from segmentation_models_pytorch.metrics.functional import accuracy as acc  
+
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+plottable_data=None 
+height=256
+width=256
+Net=None
+batch_size=1
+optimizer=None 
+logFilePath=None
+
+def set_seed(s=41):
+	
+    torch.manual_seed(s)
+    torch.cuda.manual_seed_all(s)
+    #torch.backends.cudnn.deterministic = True
+    #torch.backends.cudnn.benchmark = False
+    np.random.seed(s)
+    #random.seed(s)
+    os.environ['PYTHONHASHSEED'] = str(s)
+
+
+tensorise=tf.ToTensor()
+
+def AdaptMask(Lbl):   #function to adapt mask to Tensor
+    Lbl=Lbl.astype(np.float32)
+    Lbl=Lbl/10
+    Lbl=Lbl.astype(int)
+    Lbl=tensorise(Lbl)
+    return Lbl
+    
+
+transformImg= tf.Compose([tf.ToPILImage(),tf.ToTensor(),tf.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]) ]) #function to adapt image
+# Normalize parameters are suggested by PyTorch documentation
+
+
+
+def ReadRandomImage(folder): # Used if training on randomly selected images
+	ListOfImages=os.listdir(os.path.join(folder, "images")) # Create list of images
+	idx=np.random.randint(0,len(ListImages)) # Select random image
+	Img=cv2.imread(os.path.join(folder, "images", ListOfImages[idx]), cv2.IMREAD_COLOR)[:,:,0:3]
+	Img=transformImg(Img)
+    
+	if Path(os.path.join(folder, "labels", ListOfImages[idx])).is_file():
+		Lbl=cv2.imread(os.path.join(folder, "labels", ListOfImages[idx]), cv2.COLOR_GRAY2BGR ) 
+		Lbl=AdaptMask(Lbl)
+	else:	Lbl=torch.zeros(width, height,dtype=torch.int32)
+   
+	return Img,Lbl
+
+
+
+def LoadBatch(folder): # Load batch of Random images
+	global batch_size
+	images = torch.zeros([batch_size,3,height,width])
+	labels = torch.zeros([batch_size, height, width])
+	for i in range(batch_size):
+		images[i],labels[i]=ReadRandomImage(folder)
+	
+	return images, labels
+
+
+def LoadNext(batchNum,batchSize,folder):
+	#global batch_size
+	ListOfImages=os.listdir(os.path.join(folder, "images"))
+	images = torch.zeros([batchSize,3,height,width])
+	labels = torch.zeros([batchSize, height, width])
+	
+	for item in range(batchSize):
+		idx=(batchNum*batchSize)+item 
+		#print ("idx:",idx, "  path:", os.path.join(folder, "labels", ListOfImages[idx]) )
+		Img=cv2.imread(os.path.join(folder, "images", ListOfImages[idx]), cv2.IMREAD_COLOR)[:,:,0:3]
+		Img=transformImg(Img)
+        
+		# now we check if the label exists.  We read it ELSE generate blank tensor
+		if Path(os.path.join(folder, "labels", ListOfImages[idx])).is_file():
+			Lbl=cv2.imread(os.path.join(folder, "labels", ListOfImages[idx]), cv2.COLOR_GRAY2BGR )#[:,:,0:3]
+			Lbl=AdaptMask(Lbl)
+		else: 
+			Lbl=torch.zeros(width, height,dtype=torch.int32)
+
+		images[item]=Img
+		labels[item]=Lbl
+            
+	return images,labels
+	
+	
+def learn(imgs,lbls):
+	global Net
+	global optimizer
+	images=torch.autograd.Variable(imgs,requires_grad=False).to(device) # Load image
+	labels = torch.autograd.Variable(lbls, requires_grad=False).to(device) # Load labels
+	Pred=Net(images)#['out'] # make prediction
+	Net.zero_grad()
+	criterion = torch.nn.CrossEntropyLoss() # Set loss function
+	Loss=criterion(Pred,labels.long()) # Calculate cross entropy loss
+	Loss.backward() # Backpropogate loss
+	this_loss=copy.deepcopy(Loss.data).cpu().detach().numpy() #this_loss=Loss.data.cpu().numpy()
+	optimizer.step() #not used see if necessary
+	return this_loss
+
+
+def validate(imgs,lbls,vbatch_size):
+	global Net
+	
+	images=torch.autograd.Variable(imgs,requires_grad=False).to(device) # Load image
+	labels = torch.autograd.Variable(lbls, requires_grad=False).to(device) # Load labels
+	Pred=Net(images)#['out'] # make prediction
+	Net.zero_grad()
+	criterion = torch.nn.CrossEntropyLoss() # Set loss function
+	Loss=criterion(Pred,labels.long()) # Calculate cross entropy loss
+	this_loss=copy.deepcopy(Loss.data).cpu().detach().numpy()
+		
+	tp, fp, fn, tn = smp.metrics.get_stats(Pred[0:vbatch_size,1], lbls.long().to(device), mode='binary', threshold=0.5)
+	accuracy = acc(tp, fp, fn, tn, reduction="micro")
+    
+	return this_loss , float(accuracy)
+
+
+
+def Netname(Net): #Genrates string based on Model and backbone for naming files
+	string=str(Net)[0:50]
+	model_name=""
+	backbone=""
+	writemode=True
+	writemode2=False
+
+	for c in string:
+		if writemode2==True and c=='(': break
+		if c=='(':
+			writemode=False
+			
+		if writemode: model_name=model_name+c
+		if c==':': writemode2=True
+		if writemode2: backbone=backbone+c
+		
+	#backbone= backbone[2:11]
+	return model_name+'-'+backbone[2:11]
+
+
+def LoadNet(model,checkpoint):
+	global Net
+	Net = model # Load net
+	Net=Net.to(device)
+	Net.load_state_dict(torch.load(checkpoint))
+	return Net
+
+
+
+def trainStart(model, TrainFolder, ValidFolder,epochs, batchSize,TestFolder=None,Learning_Rate=1e-5, logName=None):
+	#log will not save test loss in this version
+	global plottable_data
+	global batch_size
+	global Net
+	global height
+	global width
+	global optimizer
+	global logFilePath
+	
+	batch_size=batchSize
+	vbatch_size=batchSize*4
+	ListImages=os.listdir(os.path.join(TrainFolder, "images")) # Create list of images		
+	vListImages=os.listdir(os.path.join(ValidFolder, "images")) # Create list of validation images
+	
+	if TestFolder!=None: 
+		tbatch_size=batchSize*4
+		tListImages=os.listdir(os.path.join(TestFolder, "images")) # Create list of test images
+		tunbatched=len(tListImages)%tbatch_size
+		tbatch_counts=round((len(tListImages)-tunbatched)/tbatch_size)
+	else:
+		tbatch_counts=0
+	
+	#autodetect height and width of training tiles
+	tempImage=cv2.imread(os.path.join(TrainFolder, "images", ListImages[0]), cv2.IMREAD_COLOR)
+	height=tempImage.shape[0]
+	width=tempImage.shape[1]
+	del tempImage
+	
+	#load model 
+	Net = model # Load net
+	Net=Net.to(device)
+	model_naming_title=Netname(Net)
+	
+	t=datetime.now()
+	DateTime =str(t.hour)+str(t.minute)+"-"+str(t.day)+"-"+str(t.month)+"-"+str(t.year)
+
+	path='Models/'+model_naming_title+"-"+DateTime
+	del t
+	del DateTime
+	if not os.path.exists(path): os.makedirs(path)
+
+	if logName==None:
+		log_path='LOG for '+model_naming_title+'.csv'
+	else:
+		log_path=logName
+
+	if not os.path.exists(log_path):
+		log_path2="./"+path+'/LOG for '+path+'.csv'
+		log_titles=['Epoch','Train-Loss','Val-Loss', 'Val-Acc', 'Test-Loss','Test-Acc', 'Time','Learn-Rate','Session','CheckPoint']
+		log_DB=pd.DataFrame( columns=log_titles)
+		log_DB2=pd.DataFrame( columns=log_titles)
+		model_naming_title="-"+model_naming_title+".torch"
+
+		print(" Folder for checkpoints:'",path,"' was created")
+		print(" Training Log File:'",log_path,"' will be created... Starting training from scratch")
+		Learning_Rate
+		best_loss=1
+		EpochsStartFrom=0  #in case training is restarted from a previously saved epoch, this continues the sequence
+		# and prevents over-writing models and logs in the loss database 
+
+		optimizer=torch.optim.Adam(params=Net.parameters(),lr=Learning_Rate) # Create adam optimizer
+		scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+
+		unbatched=len(ListImages)%batch_size
+		batch_counts=round((len(ListImages)-unbatched)/batch_size)
+		vunbatched=len(vListImages)%vbatch_size
+		vbatch_counts=round((len(vListImages)-vunbatched)/vbatch_size)
+		
+		trainingDetails(path,TrainFolder, batch_counts, ValidFolder, vbatch_counts, str(TestFolder),tbatch_counts, '0', epochs-1, finished=False)
+ 		
+	else: 
+		print("Log file for ",model_naming_title, " already present as: ", log_path)
+		print("Training will not start, to prevent overwriting")
+		print(" ")
+		print("If you really want to start from scratch, please move the existent log file")
+		print("If you want to continue training please use the trainfromLast function instead")
+		return
+		
+		
+	#_________________________PREPERATION DONE_________________#
+	#_________________________TRAINING LOOP STARTS FROM HERE_________________#
+	with torch.autograd.set_detect_anomaly(False):
+		gc.collect()
+		cuda.empty_cache()
+
+		for itr in range(epochs): # Training loop
+			start_time= datetime.now()
+			train_loss=0
+			runs=batch_counts
+			vruns=vbatch_counts
+			
+			Net.train()
+			for batchNum in tqdm(range(batch_counts)):
+				images,labels=LoadNext(batchNum,batch_size,TrainFolder)
+				train_loss=train_loss+learn(images, labels)
+				del images
+				del labels
+				gc.collect()
+				cuda.empty_cache()
+       
+			if unbatched>0:
+				images,labels=LoadNext(batch_counts+1,unbatched,TrainFolder)
+				train_loss=train_loss+learn(images, labels)
+				runs=batch_counts+1
+				del images
+				del labels
+				gc.collect()
+				cuda.empty_cache()
+    
+			#uncomment if you want to train on a random batch too
+			#images,labels=LoadBatch(TrainFolder) 
+			#train_loss+=learn(images, labels)
+			#runs=batch_counts+1
+         
+
+			train_loss=train_loss/(runs) # +1) #averages the loss on all batches
+			scheduler.step(train_loss)
+        
+			#BEGIN Validation 
+			Net.eval()
+			with torch.no_grad():
+				valid_loss=0
+				ValACC=0
+        
+				for vbatchNum in tqdm(range(vbatch_counts)):
+					images,labels=LoadNext(vbatchNum,vbatch_size,ValidFolder)
+					newVloss,batch_accuracy=validate(images, labels,vbatch_size)
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+					valid_loss=valid_loss+newVloss
+					ValACC=ValACC+batch_accuracy
+       
+				if vunbatched>0:
+					images,labels=LoadNext(vbatch_counts+1,vunbatched,ValidFolder)
+					newVloss,batch_accuracy=validate(images, labels,vbatch_size)
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+					valid_loss=valid_loss+newVloss
+					ValACC=ValACC+batch_accuracy
+					vruns=vbatch_counts+1
+        
+				valid_loss=valid_loss/(vruns) #averages the loss on all batches
+				ValACC=ValACC/(vruns)
+            	#END   Validation
+				
+				test_loss=0
+				testACC=0
+				if TestFolder!=None:
+					truns=tbatch_counts
+					for tbatchNum in tqdm(range(tbatch_counts)):
+						images,labels=LoadNext(tbatchNum,tbatch_size,TestFolder)
+						newVloss,batch_accuracy=validate(images, labels,tbatch_size)
+						del images
+						del labels
+						gc.collect()
+						cuda.empty_cache()
+						test_loss=test_loss+newVloss
+						testACC=testACC+batch_accuracy
+       
+					if tunbatched>0:
+						images,labels=LoadNext(tbatch_counts+1,tunbatched,TestFolder)
+						newVloss,batch_accuracy=validate(images, labels,tbatch_size)
+						del images
+						del labels
+						gc.collect()
+						cuda.empty_cache()
+						test_loss=test_loss+newVloss
+						testACC=testACC+batch_accuracy
+						truns=tbatch_counts+1
+        
+					test_loss=test_loss/(truns) #averages the loss on all batches
+					testACC=testACC/(truns)
+					#END Test				
+			
+     
+			duration=datetime.now()-start_time
+        
+			if train_loss<=best_loss:
+				best_loss=copy.deepcopy(train_loss)
+    
+			t=datetime.now()
+			checkpoint=path+"/"+str(itr+EpochsStartFrom)+"-"+str(t.hour)+str(t.minute)+model_naming_title
+			print("Saving Model: ", "./"+checkpoint)
+			torch.save(Net.state_dict(),"./"+checkpoint)
+    
+			"""
+			else:
+				if itr!=epochs-1:  checkpoint="not saved"
+				else:
+					checkpoint=path+"/"+str(itr+EpochsStartFrom)+"-LAST EPOCH-"+model_naming_title
+					torch.save(Net.state_dict(),"./"+checkpoint)
+					print(" Saving LAST EPOCH: ./",checkpoint)
+			"""    
+			print(itr+EpochsStartFrom,"=> TrainLoss=",train_loss,"  ValLoss=", valid_loss,  "  valACC=",ValACC, " TestLoss=", test_loss," testACC=",testACC, " lr:", scheduler.state_dict()["_last_lr"][0], " Time:", duration.seconds)
+			new_log_entry=pd.DataFrame([[itr+EpochsStartFrom, train_loss, valid_loss,ValACC,test_loss,testACC, duration.seconds,float(scheduler.state_dict()["_last_lr"][0]),path,checkpoint]], columns=log_titles)
+			log_DB=pd.concat([log_DB, new_log_entry])
+			log_DB.to_csv(log_path, sep=",")
+			log_DB2=pd.concat([log_DB2, new_log_entry])
+			log_DB2.to_csv(log_path2, sep=",")
+
+	#_________________________TRAINING LOOP ENDS HERE_________________#
+	trainingDetails(path,TrainFolder, batch_counts, ValidFolder, vbatch_counts, str(TestFolder),tbatch_counts, '0', checkpoint, finished=True)
+	plottable_data =log_DB
+	print("____FINISHED Training______")
+	return log_DB
+
+
+ 
+def trainFromLast(model, TrainFolder, ValidFolder, epochs, batchSize, TestFolder=None, Learning_Rate=0):
+	global plottable_data
+	global batch_size
+	global Net
+	global optimizer
+	global logFilePath
+	batch_size=batchSize
+	vbatch_size=batchSize*4
+	ListImages=os.listdir(os.path.join(TrainFolder, "images")) # Create list of images		
+	vListImages=os.listdir(os.path.join(ValidFolder, "images")) # Create list of validation images
+
+	if TestFolder!=None: 
+		tbatch_size=batchSize*4
+		tListImages=os.listdir(os.path.join(TestFolder, "images")) # Create list of test images
+		tunbatched=len(tListImages)%tbatch_size
+		tbatch_counts=round((len(tListImages)-tunbatched)/tbatch_size)
+	else:
+		tbatch_counts=0
+	
+	global height
+	global width
+	#autodetect height and width of training tiles
+	tempImage=cv2.imread(os.path.join(TrainFolder, "images", ListImages[0]), cv2.IMREAD_COLOR)
+	height=tempImage.shape[0]
+	width=tempImage.shape[1]
+	del tempImage
+	
+	Net = model # Load net
+	Net=Net.to(device)
+	gc.collect()
+	cuda.empty_cache()
+	model_naming_title=Netname(Net)
+	
+	log_path='LOG for '+model_naming_title+'.csv'
+	logFilePath=log_path
+	log_titles=['Epoch','Train-Loss','Val-Loss', 'Val-Acc', 'Test-Loss','Test-Acc', 'Time','Learn-Rate','Session','CheckPoint']
+	log_DB=pd.DataFrame( columns=log_titles)
+
+	if os.path.exists(log_path):
+		print("A log file for ",model_naming_title," was found as: ",log_path)
+		log_DB=pd.read_csv(log_path, sep=",", index_col=0)
+		path=log_DB.tail(1)['Session']
+		path=str(path[0])
+		best_loss=log_DB['Train-Loss'].min() #smallest loss value
+		LastEpoch=int(log_DB.tail(1)['Epoch'])
+		LastCheckpoint=log_DB.tail(1)['CheckPoint']
+		if Learning_Rate==0: Learning_Rate=float(log_DB.tail(1)['Learn-Rate'])  #the last learning rate logged
+		EpochsStartFrom=LastEpoch+1
+    
+		if os.path.exists(path):
+			print("Folder for checkpoints: ",path, " was found")
+		elif os.path.exists('Models/'+path):
+			path='Models/'+path
+			print("Folder for checkpoints: ",path, " was found")
+		else:
+			print("Folder for checkpoints: ",path, " or Models/"+path+" were not found.  Training cannot continue")
+			del epochs
+			print(" Please restore the folder and restart this notebook, or start training from scratch in appropriate notebook")
+			return
+		
+		if os.path.exists("./"+LastCheckpoint[0]):
+			checkpoint ="./"+LastCheckpoint[0] # Path to trained model
+			print("Training to continue from checkpoint:", checkpoint)
+		elif os.path.exists("./Models/"+LastCheckpoint[0]):
+			checkpoint ="./Models/"+LastCheckpoint[0] # Path to trained model
+			print("Training to continue from checkpoint:", checkpoint)
+		else: 
+			print("Last Checkpoint was found at NEITHER ./"+LastCheckpoint[0]+" NOR at ./Models/"+LastCheckpoint[0]+"  .  Training cannot continue")
+			#print(" Please specify a path to a saved checkpoint manually in the next cell")
+			return
+			
+	else:
+		print(" Training Log File:  '",log_path,"'  was not found...  ")
+		print(" Either restore the log file, pass a different model_naming_title to trainFromLast() , or start training from scratch with trainStart() ")
+		return
+	#_________________________PREPERATION DONE_________________#
+	Net.load_state_dict(torch.load(checkpoint))  #if this gives an error check the training setup in previous 2 cells
+	optimizer=torch.optim.Adam(params=Net.parameters(),lr=Learning_Rate) # Create adam optimizer
+	scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+            
+	model_naming_title="-"+model_naming_title+".torch"
+	log_path2="./"+path+'/LOG for '+path+'.csv'
+	log_DB2=pd.read_csv(log_path2, sep=",", index_col=0)
+            
+	unbatched=len(ListImages)%batch_size
+	batch_counts=round((len(ListImages)-unbatched)/batch_size)
+	vunbatched=len(vListImages)%vbatch_size
+	vbatch_counts=round((len(vListImages)-vunbatched)/vbatch_size)
+
+	trainingDetails(path,TrainFolder, batch_counts, ValidFolder, vbatch_counts, str(TestFolder),tbatch_counts, checkpoint, EpochsStartFrom+epochs, finished=False)
+	#_________________________TRAINING STARTS FROM HERE_________________#
+
+	with torch.autograd.set_detect_anomaly(False):
+		for itr in range(epochs): # Training loop
+			start_time= datetime.now()
+			train_loss=0
+			runs=batch_counts
+			vruns=vbatch_counts
+    
+			Net.train()
+			for batchNum in tqdm(range(batch_counts)):
+				images,labels=LoadNext(batchNum,batch_size,TrainFolder)
+				train_loss=train_loss+learn(images, labels)
+				del images
+				del labels
+				gc.collect()
+				cuda.empty_cache()
+       
+			if unbatched>0:
+				images,labels=LoadNext(batch_counts+1,unbatched,TrainFolder)
+				train_loss=train_loss+learn(images, labels)
+				runs=batch_counts+1
+				del images
+				del labels
+				gc.collect()
+				cuda.empty_cache()
+    
+			#uncomment if you want to train on a random batch too
+			"""
+			images,labels=LoadBatch(TrainFloder) 
+			train_loss+=learn(images, labels)
+			runs=batch_counts+1
+			"""
+
+			train_loss=train_loss/(runs) # +1) #averages the loss on all batches
+			scheduler.step(train_loss)
+			print(itr+EpochsStartFrom,"=> TrainLoss=",train_loss)
+			#BEGIN Validation 
+			
+			Net.eval()
+			with torch.no_grad():
+				valid_loss=0
+				ValACC=0
+        
+				for vbatchNum in tqdm(range(vbatch_counts)):
+					images,labels=LoadNext(vbatchNum,vbatch_size,ValidFolder)
+					newVloss,batch_accuracy=validate(images, labels,vbatch_size)
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+					valid_loss=valid_loss+newVloss
+					ValACC=ValACC+batch_accuracy
+       
+				if vunbatched>0:
+					images,labels=LoadNext(vbatch_counts+1,vunbatched,ValidFolder)
+					newVloss,batch_accuracy=validate(images, labels,vbatch_size)
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+					valid_loss=valid_loss+newVloss
+					ValACC=ValACC+batch_accuracy
+					vruns=vbatch_counts+1
+        
+				valid_loss=valid_loss/(vruns) #averages the loss on all batches
+				ValACC=ValACC/(vruns)
+				print(itr+EpochsStartFrom,"=> ValLoss=", valid_loss,  " valACC=",ValACC)
+				#END   Validation
+				
+				test_loss=0
+				testACC=0
+				if TestFolder!=None:
+					truns=tbatch_counts
+					for tbatchNum in tqdm(range(tbatch_counts)):
+						images,labels=LoadNext(tbatchNum,tbatch_size,TestFolder)
+						newVloss,batch_accuracy=validate(images, labels,tbatch_size)
+						del images
+						del labels
+						gc.collect()
+						cuda.empty_cache()
+						test_loss=test_loss+newVloss
+						testACC=testACC+batch_accuracy
+       
+					if tunbatched>0:
+						images,labels=LoadNext(tbatch_counts+1,tunbatched,TestFolder)
+						newVloss,batch_accuracy=validate(images, labels,tbatch_size)
+						del images
+						del labels
+						gc.collect()
+						cuda.empty_cache()
+						test_loss=test_loss+newVloss
+						testACC=testACC+batch_accuracy
+						truns=tbatch_counts+1
+        
+					test_loss=test_loss/(truns) #averages the loss on all batches
+					testACC=testACC/(truns)
+					print(itr+EpochsStartFrom,"=>  TestLoss=", test_loss," testACC=",testACC)
+					#END Test				
+			
+     
+			duration=datetime.now()-start_time
+        
+			if train_loss<=best_loss:
+				best_loss=copy.deepcopy(train_loss)
+    
+			t=datetime.now()
+			checkpoint=path+"/"+str(itr+EpochsStartFrom)+"-"+str(t.hour)+str(t.minute)+model_naming_title
+			print("Saving Model: ", "./"+checkpoint, end="")
+			torch.save(Net.state_dict(),"./"+checkpoint)
+    
+			"""
+			else:
+				if itr!=epochs-1:  checkpoint="not saved"
+				else:
+					checkpoint=path+"/"+str(itr+EpochsStartFrom)+"-LAST EPOCH-"+model_naming_title
+					torch.save(Net.state_dict(),"./"+checkpoint)
+					print(" Saving LAST EPOCH: ./",checkpoint)
+			"""    
+			print("lr:", scheduler.state_dict()["_last_lr"][0], "  Time:", duration.seconds)
+			#new_log_entry=pd.DataFrame([[itr+EpochsStartFrom, train_loss, valid_loss,ValACC, float(scheduler.state_dict()["_last_lr"][0]),path,checkpoint]], columns=log_titles)
+			new_log_entry=pd.DataFrame([[itr+EpochsStartFrom, train_loss, valid_loss,ValACC,test_loss,testACC, duration.seconds , float(scheduler.state_dict()["_last_lr"][0]),path,checkpoint]], columns=log_titles)
+			log_DB=pd.concat([log_DB, new_log_entry])
+			log_DB.to_csv(log_path, sep=",")
+			log_DB2=pd.concat([log_DB2, new_log_entry])
+			log_DB2.to_csv(log_path2, sep=",")
+
+	#_________________________TRAINING LOOP ENDS HERE_________________#
+	trainingDetails(path,TrainFolder, batch_counts, ValidFolder, vbatch_counts, str(TestFolder),tbatch_counts, str(EpochsStartFrom), checkpoint, finished=True)
+	plottable_data =log_DB
+	print("____FINISHED Training______")
+	return log_DB
+
+
+def plotTraining():
+	global plottable_data
+	import matplotlib.pyplot as plt
+	
+	xAxis=plottable_data['Epoch']
+	yAxis=plottable_data['Train-Loss']
+	yAxis2=plottable_data['Val-Loss']
+
+	plt.plot(xAxis,yAxis,xAxis,yAxis2)
+
+	plt.title('Loss Chart')
+	plt.xlabel('Epoch')
+	plt.ylabel('Loss')
+	plt.grid()
+	plt.show()
+
+def fineTune(model,checkpoint_path,TrainFolder,ValidFolder, epochs, batchSize, TrainFolder2=None,TestFolder=None,Learning_Rate=1e-5):
+	global height
+	global width
+	tempImage=cv2.imread(os.path.join(TrainFolder, "images", ListImages[0]), cv2.IMREAD_COLOR)
+	height=tempImage.shape[0]
+	width=tempImage.shape[1]
+	del tempImage	
+	
+	global Net
+	global optimizer
+	
+	model_naming_title=Netname(model)
+	Net = model # Load net
+	Net=Net.to(device)
+	print("Loading checkpoint ",checkpoint_path,end=" ...")
+	Net.load_state_dict(torch.load(checkpoint_path))
+	optimizer=torch.optim.Adam(params=Net.parameters(),lr=Learning_Rate) # Create adam optimizer
+	scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+	gc.collect()
+	cuda.empty_cache()
+	print ("... DONE")
+
+	t=datetime.now()
+	DateTime =str(t.hour)+str(t.minute)+"-"+str(t.day)+"-"+str(t.month)+"-"+str(t.year)
+
+	path='Models/FINETUNE'+model_naming_title+"-"+DateTime
+	del t
+	del DateTime
+	if not os.path.exists(path): os.makedirs(path)	
+	
+	global batch_size
+	batch_size= batchSize
+	vbatch_size=batchSize*4
+	
+	global plottable_data
+	global logFilePath
+	
+	log_path='Log for FINETUNING '+model_naming_title+'.csv'
+
+	log_path2="./"+path+'/LOG for FINETUNING '+model_naming_title+"-"+DateTime+'.csv'
+	logFilePath=log_path
+	log_titles=['Epoch','Train-Loss','Val-Loss', 'Val-Acc', 'Test-Loss','Test-Acc', 'Time','Learn-Rate','Session','CheckPoint']
+	log_DB=pd.DataFrame( columns=log_titles)
+	
+	
+	ListImages=os.listdir(os.path.join(TrainFolder, "images")) # Create list of images		
+	unbatched=len(ListImages)%batch_size
+	batch_counts=round((len(ListImages)-unbatched)/batch_size)
+	vListImages=os.listdir(os.path.join(ValidFolder, "images")) # Create list of validation images
+	vunbatched=len(vListImages)%vbatch_size
+	vbatch_counts=round((len(vListImages)-vunbatched)/vbatch_size)
+
+	if TestFolder!=None: 
+		tbatch_size=batchSize*4
+		tListImages=os.listdir(os.path.join(TestFolder, "images")) # Create list of test images
+		tunbatched=len(tListImages)%tbatch_size
+		tbatch_counts=round((len(tListImages)-tunbatched)/tbatch_size)
+	else:
+		tbatch_counts=0
+		
+	if TrainFolder2!=None: 
+		ListImages2=os.listdir(os.path.join(TrainFolder2, "images")) # Create list of test images
+		unbatched2=len(ListImages2)%tbatch_size
+		batch_counts2=round((len(ListImages2)-unbatched2)/batch_size)
+	else:
+		batch_counts2=0
+		
+	trainingDetails(path,str(TrainFolder)+' and '+str(TrainFolder2), str(batch_counts)+' and '+str(batch_counts2), ValidFolder, vbatch_counts, str(TestFolder),tbatch_counts, '0', epochs-1, finished=False)
+	
+	EpochsStartFrom=0
+	#_________________________TRAINING LOOP STARTS FROM HERE_________________#
+	with torch.autograd.set_detect_anomaly(False):
+		gc.collect()
+		cuda.empty_cache()
+
+		for itr in range(epochs): # Training loop
+			start_time= datetime.now()
+			train_loss=0
+			runs=batch_counts
+			vruns=vbatch_counts
+			
+			Net.train()
+			for batchNum in tqdm(range(batch_counts)):
+				images,labels=LoadNext(batchNum,batch_size,TrainFolder)
+				train_loss=train_loss+learn(images, labels)
+				del images
+				del labels
+				gc.collect()
+				cuda.empty_cache()
+       
+			if unbatched>0:
+				images,labels=LoadNext(batch_counts+1,unbatched,TrainFolder)
+				train_loss=train_loss+learn(images, labels)
+				runs=batch_counts+1
+				del images
+				del labels
+				gc.collect()
+				cuda.empty_cache()
+    
+			
+			if TrainFolder2!=None:
+				for batchNum in tqdm(range(batch_counts2)):
+					images,labels=LoadNext(batchNum,batch_size,TrainFolder2)
+					train_loss=train_loss+learn(images, labels)
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+				
+				runs=runs+batch_counts2
+       
+				if unbatched2>0:
+					images,labels=LoadNext(batch_counts+1,unbatched2,TrainFolder2)
+					train_loss=train_loss+learn(images, labels)
+					runs=batch_counts+1
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+			
+
+			train_loss=train_loss/(runs) # +1) #averages the loss on all batches
+			scheduler.step(train_loss)
+        
+			#BEGIN Validation 
+			Net.eval()
+			with torch.no_grad():
+				valid_loss=0
+				ValACC=0
+        
+				for vbatchNum in tqdm(range(vbatch_counts)):
+					images,labels=LoadNext(vbatchNum,vbatch_size,ValidFolder)
+					newVloss,batch_accuracy=validate(images, labels,vbatch_size)
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+					valid_loss=valid_loss+newVloss
+					ValACC=ValACC+batch_accuracy
+       
+				if vunbatched>0:
+					images,labels=LoadNext(vbatch_counts+1,vunbatched,ValidFolder)
+					newVloss,batch_accuracy=validate(images, labels,vbatch_size)
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+					valid_loss=valid_loss+newVloss
+					ValACC=ValACC+batch_accuracy
+					vruns=vbatch_counts+1
+        
+				valid_loss=valid_loss/(vruns) #averages the loss on all batches
+				ValACC=ValACC/(vruns)
+            	#END   Validation
+				
+				test_loss=0
+				testACC=0
+				if TestFolder!=None:
+					truns=tbatch_counts
+					for tbatchNum in tqdm(range(tbatch_counts)):
+						images,labels=LoadNext(tbatchNum,tbatch_size,TestFolder)
+						newVloss,batch_accuracy=validate(images, labels,tbatch_size)
+						del images
+						del labels
+						gc.collect()
+						cuda.empty_cache()
+						test_loss=test_loss+newVloss
+						testACC=testACC+batch_accuracy
+       
+					if tunbatched>0:
+						images,labels=LoadNext(tbatch_counts+1,tunbatched,TestFolder)
+						newVloss,batch_accuracy=validate(images, labels,tbatch_size)
+						del images
+						del labels
+						gc.collect()
+						cuda.empty_cache()
+						test_loss=test_loss+newVloss
+						testACC=testACC+batch_accuracy
+						truns=tbatch_counts+1
+        
+					test_loss=test_loss/(truns) #averages the loss on all batches
+					testACC=testACC/(truns)
+					#END Test				
+			
+     
+			duration=datetime.now()-start_time
+        
+			if train_loss<=best_loss:
+				best_loss=copy.deepcopy(train_loss)
+    
+			t=datetime.now()
+			checkpoint=path+"/"+str(itr+EpochsStartFrom)+"-"+str(t.hour)+str(t.minute)+model_naming_title
+			print("Saving Model: ", "./"+checkpoint)
+			torch.save(Net.state_dict(),"./"+checkpoint)
+    
+			"""
+			else:
+				if itr!=epochs-1:  checkpoint="not saved"
+				else:
+					checkpoint=path+"/"+str(itr+EpochsStartFrom)+"-LAST EPOCH-"+model_naming_title
+					torch.save(Net.state_dict(),"./"+checkpoint)
+					print(" Saving LAST EPOCH: ./",checkpoint)
+			"""    
+			print(itr+EpochsStartFrom,"=> TrainLoss=",train_loss,"  ValLoss=", valid_loss,  "  valACC=",ValACC, " TestLoss=", test_loss," testACC=",testACC, " lr:", scheduler.state_dict()["_last_lr"][0], " Time:", duration.seconds)
+			new_log_entry=pd.DataFrame([[itr+EpochsStartFrom, train_loss, valid_loss,ValACC,test_loss,testACC, duration.seconds,float(scheduler.state_dict()["_last_lr"][0]),path,checkpoint]], columns=log_titles)
+			log_DB=pd.concat([log_DB, new_log_entry])
+			log_DB.to_csv(log_path, sep=",")
+			log_DB2=pd.concat([log_DB2, new_log_entry])
+			log_DB2.to_csv(log_path2, sep=",")
+
+	#_________________________TRAINING LOOP ENDS HERE_________________#
+	trainingDetails(path,TrainFolder, batch_counts, ValidFolder, vbatch_counts, str(TestFolder),tbatch_counts, '0', checkpoint, finished=True)
+	print("____FINISHED FINE TUNING______")
+	plottable_data =log_DB
+	return log_DB 
+
+
+def GenerateLog(model,CheckpointFolder,TrainFolder,ValidFolder,TestFolder=None,batchSize=192):
+
+	def getEpochNum(c):  #takes checkpoint name and returns the check point number
+		epochNum=''
+		for l in c:
+			if l!='-':	epochNum=epochNum+l
+			else: break
+		return epochNum
+
+	global height
+	global width
+	#global optimizer
+	#global logFilePath
+	global batch_size
+	batch_size= batchSize
+	
+	global Net
+	Net = model # Load net
+	Net=Net.to(device)
+	
+	ListImages=os.listdir(os.path.join(TrainFolder, "images")) # Create list of images		
+	vListImages=os.listdir(os.path.join(ValidFolder, "images")) # Create list of validation images
+	if TestFolder!=None: 
+		tListImages=os.listdir(os.path.join(TestFolder, "images")) # Create list of test images
+
+	unbatched=len(ListImages)%batch_size
+	batch_counts=round((len(ListImages)-unbatched)/batch_size)
+	vunbatched=len(vListImages)%batch_size
+	vbatch_counts=round((len(vListImages)-vunbatched)/batch_size)
+	if TestFolder!=None: 
+		tListImages=os.listdir(os.path.join(TestFolder, "images")) # Create list of test images
+		tbatch_size=batchSize
+		tunbatched=len(tListImages)%tbatch_size
+		tbatch_counts=round((len(tListImages)-tunbatched)/tbatch_size)
+		
+	log_path="./"+CheckpointFolder+'/LOG for RENAME HERE.csv'
+	DBtitles=['Epoch','Train-Loss','Val-Loss', 'Val-Acc', 'Test-Loss','Test-Acc', 'Time','Learn-Rate','Session','CheckPoint']
+	log_DB=pd.DataFrame( columns=DBtitles)
+	
+	
+	s=os.path.dirname(CheckpointFolder)
+	
+	temp=os.listdir(CheckpointFolder)
+	CheckPointList=[]
+	for c in temp:
+		if c[-6:]=='.torch':
+			CheckPointList.append(c)
+	del temp
+	
+	i=0
+	for c in CheckPointList:
+	
+		Net.load_state_dict(torch.load('./'+CheckpointFolder+'/'+c))
+		Net.eval()
+		with torch.no_grad():
+			train_loss=0
+			runs=batch_counts
+			vruns=vbatch_counts
+
+			for batchNum in tqdm(range(batch_counts)):
+				images,labels=LoadNext(batchNum,batch_size,TrainFolder)
+				train_loss,batch_accuracy=train_loss+validate(images, labels)
+				del images
+				del labels
+				gc.collect()
+				cuda.empty_cache()
+       
+			if unbatched>0:
+				images,labels=LoadNext(batch_counts+1,unbatched,TrainFolder)
+				train_loss,batch_accuracy=train_loss+validate(images, labels)
+				runs=batch_counts+1
+				del images
+				del labels
+				gc.collect()
+				cuda.empty_cache()
+		
+			train_loss=train_loss/(runs) # +1) #averages the loss on all batches
+	
+			valid_loss=0
+			ValACC=0
+        
+			for vbatchNum in tqdm(range(vbatch_counts)):
+					images,labels=LoadNext(vbatchNum,batch_size,ValidFolder)
+					newVloss,batch_accuracy=validate(images, labels,batch_size)
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+					valid_loss=valid_loss+newVloss
+					ValACC=ValACC+batch_accuracy
+       
+			if vunbatched>0:
+					images,labels=LoadNext(vbatch_counts+1,vunbatched,ValidFolder)
+					newVloss,batch_accuracy=validate(images, labels,vunbatched)
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+					valid_loss=valid_loss+newVloss
+					ValACC=ValACC+batch_accuracy
+					vruns=vbatch_counts+1
+        
+			valid_loss=valid_loss/(vruns) #averages the loss on all batches
+			ValACC=ValACC/(vruns)
+		
+			test_loss=0
+			testACC=0
+			if TestFolder!=None:
+				truns=tbatch_counts
+				for tbatchNum in tqdm(range(tbatch_counts)):
+					images,labels=LoadNext(tbatchNum,tbatch_size,TestFolder)
+					newVloss,batch_accuracy=validate(images, labels,tbatch_size)
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+					test_loss=test_loss+newVloss
+					testACC=testACC+batch_accuracy
+       
+				if tunbatched>0:
+					images,labels=LoadNext(tbatch_counts+1,tunbatched,TestFolder)
+					newVloss,batch_accuracy=validate(images, labels,tbatch_size)
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+					test_loss=test_loss+newVloss
+					testACC=testACC+batch_accuracy
+					truns=tbatch_counts+1
+        
+				test_loss=test_loss/(truns) #averages the loss on all batches
+				testACC=testACC/(truns)
+		
+		#['Epoch','Train-Loss','Val-Loss', 'Val-Acc', 'Test-Loss','Test-Acc', 'Time','Learn-Rate','Session','CheckPoint']
+		#print("checkpoint:", i, "  ", c, "  loss:",valid_loss )
+		new_entry=pd.DataFrame([[getEpochNum(c), train_loss, valid_loss,ValACC,test_loss,testACC, duration.seconds , float(scheduler.state_dict()["_last_lr"][0]),CheckpointFolder+'/'+c,c]], columns=DBtitles)
+		log_DB=pd.concat([log_DB, new_entry])
+		log_DB.to_csv(log_path, sep=",")
+		i=i+1
+		
+	print("DONE:  Log saved as: ",log_path)
+	return log_DB
+
+ 
+def validateCheckpoints(model,log_path,ValidFolder ,batchSize=128):
+	global height
+	global width
+	global Net
+	global batch_size
+
+	batch_size= batchSize
+	
+	vListImages=os.listdir(os.path.join(ValidFolder, "images")) # Create list of validation images
+	
+	
+	#autodetect height and width of training tiles
+	tempImage=cv2.imread(os.path.join(ValidFolder, "images", vListImages[0]), cv2.COLOR_GRAY2BGR )
+	height=tempImage[0]
+	width=tempImage[1]
+	del tempImage
+		
+	
+	log_DB=pd.read_csv(log_path, sep=",", index_col=0)
+	#log_DB=log_DB[log_DB['CheckPoint'][0]!= 'not saved']
+	
+	DBtitles=['Epoch','CheckPoint','Val-loss','Acc']
+	val_DB=pd.DataFrame( columns=DBtitles)
+	
+	dataset=os.path.basename(os.path.dirname(ValidFolder))
+	
+	s=log_DB[log_DB['Epoch'] == 0]
+	s=s['Session'][0]
+	
+	i=0
+			 
+	for c in log_DB['CheckPoint']:
+				
+		if c=='not saved':
+			new_entry=pd.DataFrame([[i, c, 0, 0]], columns=DBtitles)
+			val_DB=pd.concat([val_DB, new_log_entry])
+			#valDB.to_csv("./"+s+"/validation-"+Netname(Net)+"-"+dataset+".csv", sep=",")
+			i=i+1
+			continue
+		
+		if os.path.exists('./'+c):
+			Net=LoadNet(model,'./'+c)
+		elif os.path.exists('./Models/'+c):
+			Net=LoadNet(model,'./Models/'+c)
+		else:
+			print("Checkpoint ",c ," not found.  ABORTING!!")
+			continue
+		
+		vunbatched=len(vListImages)%batch_size
+		vbatch_counts=round((len(vListImages)-vunbatched)/batch_size)
+		valid_loss=0
+		ValACC=0
+		
+		Net.eval()
+		with torch.no_grad():
+			valid_loss=0
+			ValACC=0
+        
+			for vbatchNum in tqdm(range(vbatch_counts)):
+					images,labels=LoadNext(vbatchNum,batch_size,ValidFolder)
+					newVloss,batch_accuracy=validate(images, labels,batch_size)
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+					valid_loss=valid_loss+newVloss
+					ValACC=ValACC+batch_accuracy
+       
+			if vunbatched>0:
+					images,labels=LoadNext(vbatch_counts+1,vunbatched,ValidFolder)
+					newVloss,batch_accuracy=validate(images, labels,vunbatched)
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+					valid_loss=valid_loss+newVloss
+					ValACC=ValACC+batch_accuracy
+					vruns=vbatch_counts+1
+        
+		valid_loss=valid_loss/(vruns) #averages the loss on all batches
+		ValACC=ValACC/(vruns)
+		
+		print("checkpoint:", i, "  ", c, "  loss:",valid_loss )
+		new_entry=pd.DataFrame([[i, c, valid_loss,ValACC]], columns=DBtitles)
+		val_DB=pd.concat([val_DB, new_entry])
+		val_DB.to_csv("./"+s+"/validation-"+Netname(Net)+"-"+dataset+".csv", sep=",")
+		i=i+1
+		
+	print("DONE:  Saved as: ./"+s+"/validation-"+Netname(Net)+"-"+dataset+".csv")
+	
+	
+ 
+def SeedSensitivity(model, seedList,TrainFolder, ValidFolder,epochs, batchSize):
+
+	for s in seedList:
+		trainSet(model,TrainFolder, ValidFolder,epochs, batchSize)
+		#report
+	
+	return 
+	
+
+def trainingDetails(folder,train, batches, val, vbatches, test, tbatches, start, end, finished=False):
+	global Net
+	global seed
+	global height
+	global width
+	global batch_size
+	
+	t=datetime.now()
+	DateTime =str(t.hour)+str(t.minute)+"-"+str(t.day)+"-"+str(t.month)+"-"+str(t.year)
+	
+	f = open(folder+'training details'+time+'.txt', 'a')
+	
+	if finished==False:
+		f.write('Date Time: ')
+		f.write(DateTime)
+		f.write('\n')
+		f.write('Model Details: ')
+		f.write(str(Net))
+		f.write('\n')
+		f.write('Seed: '+str(seed)+'\n')
+		f.write('Train: '+str(train)+'  Batches: '+str(batches)+'\n')
+		f.write('Val: '+str(val)+'  Batches: '+str(vbatches)+'\n')
+		f.write('Test: '+str(val)+'  Batches: '+str(tbatches)+'\n')
+		f.write('Size of tiles: Height'+str(height)+' Width:'+str(width)+'\n')
+		f.write('Batch Size: '+batch_size+'\n')
+		f.write('Name of machine:'+  str(os.environ['COMPUTERNAME']) +'\n')
+		f.write('Username:'+ str( os.environ.get('USERNAME'))+ '\n')
+		f.write('Start from epoch: '+str(start)+'\n')
+		f.write('\n')
+	else:
+		f.write('Til epoch: '+str(end)+'\n')
+		f.write('Finished successfully: True ')
+		f.write('\n')
+		f.write('\n')
+		f.write('\n')
+	
+	f.close()
+
+	del f
+	
+	
+"""	
+def trainFromPoint(Net, TrainFolder, ValidFolder,epochs, batch_size, checkpoint_path, model_naming_title=Netname(Net), width=256,height=256):
+
+	ListImages=os.listdir(os.path.join(TrainFolder, "images")) # Create list of images		
+	vListImages=os.listdir(os.path.join(ValidFolder, "images")) # Create list of validation images
+	
+
+
+"""
+
+def OLDtrainStart(model, TrainFolder, ValidFolder,epochs, batchSize,TestFolder=None,Learning_Rate=1e-5):
+	#log will not save test loss in this version
+	global plottable_data
+	global batch_size
+	global Net
+	global height
+	global width
+	global optimizer
+	global logFilePath
+	
+	batch_size=batchSize
+	vbatch_size=batchSize*4
+	ListImages=os.listdir(os.path.join(TrainFolder, "images")) # Create list of images		
+	vListImages=os.listdir(os.path.join(ValidFolder, "images")) # Create list of validation images
+	
+	if TestFolder!=None: 
+		tbatch_size=batchSize*4
+		tListImages=os.listdir(os.path.join(TestFolder, "images")) # Create list of test images
+		tunbatched=len(tListImages)%tbatch_size
+		tbatch_counts=round((len(tListImages)-tunbatched)/tbatch_size)
+	
+	#autodetect height and width of training tiles
+	tempImage=cv2.imread(os.path.join(TrainFolder, "images", ListImages[0]), cv2.IMREAD_COLOR)
+	height=tempImage.shape[0]
+	width=tempImage.shape[1]
+	del tempImage
+	
+	#load model 
+	Net = model # Load net
+	Net=Net.to(device)
+	model_naming_title=Netname(Net)
+	
+	t=datetime.now()
+	DateTime =str(t.hour)+str(t.minute)+"-"+str(t.day)+"-"+str(t.month)+"-"+str(t.year)
+
+	path=model_naming_title+"-"+DateTime
+	del t
+	del DateTime
+	if not os.path.exists(path): os.makedirs(path)
+
+	log_path='LOG for '+model_naming_title+'.csv'
+	logFilePath=log_path
+
+	if not os.path.exists(log_path):
+		log_path2="./"+path+'/LOG for '+path+'.csv'
+		log_titles=['Epoch','Train-Loss','Val-Loss', 'Acc', 'Learn-Rate','Session','CheckPoint']
+		log_DB=pd.DataFrame( columns=log_titles)
+		log_DB2=pd.DataFrame( columns=log_titles)
+		model_naming_title="-"+model_naming_title+".torch"
+
+		print(" Folder for checkpoints:'",path,"' was created")
+		print(" Training Log File:'",log_path,"' will be created... Starting training from scratch")
+		Learning_Rate
+		best_loss=1
+		EpochsStartFrom=0  #in case training is restarted from a previously saved epoch, this continues the sequence
+		# and prevents over-writing models and logs in the loss database 
+
+		optimizer=torch.optim.Adam(params=Net.parameters(),lr=Learning_Rate) # Create adam optimizer
+		scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+
+		unbatched=len(ListImages)%batch_size
+		batch_counts=round((len(ListImages)-unbatched)/batch_size)
+		vunbatched=len(vListImages)%vbatch_size
+		vbatch_counts=round((len(vListImages)-vunbatched)/vbatch_size)
+		valid_loss=0
+		ValACC=0
+		
+	else: 
+		print("Log file for ",model_naming_title, " already present as: ", log_path)
+		print("Training will not start, to prevent overwriting")
+		print(" ")
+		print("If you really want to start from scratch, please move the existent log file")
+		print("If you want to continue training please use the trainfromLast function instead")
+		return
+		
+	#_________________________PREPERATION DONE_________________#
+	#_________________________TRAINING LOOP STARTS FROM HERE_________________#
+	with torch.autograd.set_detect_anomaly(False):
+		gc.collect()
+		cuda.empty_cache()
+
+		for itr in range(epochs): # Training loop
+			start_time= datetime.now()
+			train_loss=0
+			runs=batch_counts
+			vruns=vbatch_counts
+			
+			for batchNum in tqdm(range(batch_counts)):
+				images,labels=LoadNext(batchNum,batch_size,TrainFolder)
+				train_loss=train_loss+learn(images, labels)
+				del images
+				del labels
+				gc.collect()
+				cuda.empty_cache()
+       
+			if unbatched>0:
+				images,labels=LoadNext(batch_counts+1,unbatched,TrainFolder)
+				train_loss=train_loss+learn(images, labels)
+				runs=batch_counts+1
+				del images
+				del labels
+				gc.collect()
+				cuda.empty_cache()
+    
+			#uncomment if you want to train on a random batch too
+			#images,labels=LoadBatch(TrainFolder) 
+			#train_loss+=learn(images, labels)
+			#runs=batch_counts+1
+         
+
+			train_loss=train_loss/(runs) # +1) #averages the loss on all batches
+			scheduler.step(train_loss)
+        
+			#BEGIN Validation 
+			
+			with torch.no_grad():
+				valid_loss=0
+				ValACC=0
+        
+				for vbatchNum in tqdm(range(vbatch_counts)):
+					images,labels=LoadNext(vbatchNum,vbatch_size,ValidFolder)
+					newVloss,batch_accuracy=validate(images, labels,vbatch_size)
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+					valid_loss=valid_loss+newVloss
+					ValACC=ValACC+batch_accuracy
+       
+				if vunbatched>0:
+					images,labels=LoadNext(vbatch_counts+1,vunbatched,ValidFolder)
+					newVloss,batch_accuracy=validate(images, labels,vbatch_size)
+					del images
+					del labels
+					gc.collect()
+					cuda.empty_cache()
+					valid_loss=valid_loss+newVloss
+					ValACC=ValACC+batch_accuracy
+					vruns=vbatch_counts+1
+        
+				valid_loss=valid_loss/(vruns) #averages the loss on all batches
+				ValACC=ValACC/(vruns)
+            	#END   Validation
+				
+				test_loss=0
+				testACC=0
+				if TestFolder!=None:
+					for tbatchNum in tqdm(range(tbatch_counts)):
+						images,labels=LoadNext(tbatchNum,tbatch_size,TestFolder)
+						newVloss,batch_accuracy=validate(images, labels,tbatch_size)
+						del images
+						del labels
+						gc.collect()
+						cuda.empty_cache()
+						test_loss=test_loss+newVloss
+						testACC=testACC+batch_accuracy
+       
+					if tunbatched>0:
+						images,labels=LoadNext(tbatch_counts+1,tunbatched,TestFolder)
+						newVloss,batch_accuracy=validate(images, labels,tbatch_size)
+						del images
+						del labels
+						gc.collect()
+						cuda.empty_cache()
+						test_loss=test_loss+newVloss
+						testACC=testACC+batch_accuracy
+						truns=tbatch_counts+1
+        
+					test_loss=test_loss/(truns) #averages the loss on all batches
+					testACC=testACC/(truns)
+					#END Test				
+			
+     
+			duration=datetime.now()-start_time
+        
+			if train_loss<=best_loss:
+				best_loss=copy.deepcopy(train_loss)
+    
+			t=datetime.now()
+			checkpoint=path+"/"+str(itr+EpochsStartFrom)+"-"+str(t.hour)+str(t.minute)+model_naming_title
+			print("Saving Model: ", "./"+checkpoint)
+			torch.save(Net.state_dict(),"./"+checkpoint)
+    
+			"""
+			else:
+				if itr!=epochs-1:  checkpoint="not saved"
+				else:
+					checkpoint=path+"/"+str(itr+EpochsStartFrom)+"-LAST EPOCH-"+model_naming_title
+					torch.save(Net.state_dict(),"./"+checkpoint)
+					print(" Saving LAST EPOCH: ./",checkpoint)
+			"""    
+			print(itr+EpochsStartFrom,"=> TrainLoss=",train_loss,"  ValLoss=", valid_loss,  "ACC=",ValACC, "lr:", scheduler.state_dict()["_last_lr"][0], " Time:", duration.seconds)
+			new_log_entry=pd.DataFrame([[itr+EpochsStartFrom, train_loss, valid_loss,ValACC, float(scheduler.state_dict()["_last_lr"][0]),path,checkpoint]], columns=log_titles)
+			log_DB=pd.concat([log_DB, new_log_entry])
+			log_DB.to_csv(log_path, sep=",")
+			log_DB2=pd.concat([log_DB2, new_log_entry])
+			log_DB2.to_csv(log_path2, sep=",")
+
+	#_________________________TRAINING LOOP ENDS HERE_________________#
+        
+	print("____FINISHED Training______")
+	return log_DB
+
+
+if __name__ == "__main__":
+	set_seed() 
