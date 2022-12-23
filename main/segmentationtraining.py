@@ -855,6 +855,9 @@ def GenerateLog(model,CheckpointFolder,TrainFolder,ValidFolder,TestFolder=None,b
 	batch_size= batchSize
 	
 	global Net
+	Net=None
+	gc.collect()
+	cuda.empty_cache()
 	Net = model # Load net
 	Net=Net.to(device)
 	
@@ -892,6 +895,9 @@ def GenerateLog(model,CheckpointFolder,TrainFolder,ValidFolder,TestFolder=None,b
 	
 		Net.load_state_dict(torch.load('./'+CheckpointFolder+'/'+c))
 		Net.eval()
+		gc.collect()
+		cuda.empty_cache()
+		start_time= datetime.now()
 		with torch.no_grad():
 			train_loss=0
 			runs=batch_counts
@@ -899,7 +905,8 @@ def GenerateLog(model,CheckpointFolder,TrainFolder,ValidFolder,TestFolder=None,b
 
 			for batchNum in tqdm(range(batch_counts)):
 				images,labels=LoadNext(batchNum,batch_size,TrainFolder)
-				train_loss,batch_accuracy=train_loss+validate(images, labels)
+				this_loss,batch_accuracy=validate(images, labels,batch_size)
+				train_loss=this_loss+train_loss
 				del images
 				del labels
 				gc.collect()
@@ -907,7 +914,8 @@ def GenerateLog(model,CheckpointFolder,TrainFolder,ValidFolder,TestFolder=None,b
        
 			if unbatched>0:
 				images,labels=LoadNext(batch_counts+1,unbatched,TrainFolder)
-				train_loss,batch_accuracy=train_loss+validate(images, labels)
+				this_loss,batch_accuracy=validate(images, labels,batch_size)
+				train_loss=this_loss+train_loss
 				runs=batch_counts+1
 				del images
 				del labels
@@ -973,7 +981,8 @@ def GenerateLog(model,CheckpointFolder,TrainFolder,ValidFolder,TestFolder=None,b
 		
 		#['Epoch','Train-Loss','Val-Loss', 'Val-Acc', 'Test-Loss','Test-Acc', 'Time','Learn-Rate','Session','CheckPoint']
 		#print("checkpoint:", i, "  ", c, "  loss:",valid_loss )
-		new_entry=pd.DataFrame([[getEpochNum(c), train_loss, valid_loss,ValACC,test_loss,testACC, duration.seconds , float(scheduler.state_dict()["_last_lr"][0]),CheckpointFolder+'/'+c,c]], columns=DBtitles)
+		duration=datetime.now()-start_time
+		new_entry=pd.DataFrame([[getEpochNum(c), train_loss, valid_loss,ValACC,test_loss,testACC, duration.seconds , 'unknown',CheckpointFolder+'/'+c,c]], columns=DBtitles)
 		log_DB=pd.concat([log_DB, new_entry])
 		log_DB.to_csv(log_path, sep=",")
 		i=i+1
@@ -1106,10 +1115,10 @@ def trainingDetails(folder,train, batches, val, vbatches, test, tbatches, start,
 		f.write('Train: '+str(train)+'  Batches: '+str(batches)+'\n')
 		f.write('Val: '+str(val)+'  Batches: '+str(vbatches)+'\n')
 		f.write('Test: '+str(test)+'  Batches: '+str(tbatches)+'\n')
-		f.write('Size of tiles: Height'+str(height)+' Width:'+str(width)+'\n')
+		f.write('Size of tiles: Height: '+str(height)+'  Width: '+str(width)+'\n')
 		f.write('Batch Size: '+str(batch_size)+'\n')
-		f.write('Name of machine:'+  str(os.environ['COMPUTERNAME']) +'\n')
-		f.write('Username:'+ str( os.environ.get('USERNAME'))+ '\n')
+		f.write('Name of machine: '+  str(os.environ['COMPUTERNAME']) +'\n')
+		f.write('Username: '+ str( os.environ.get('USERNAME'))+ '\n')
 		f.write('Start from epoch: '+str(start)+'\n')
 		f.write('\n')
 	else:
