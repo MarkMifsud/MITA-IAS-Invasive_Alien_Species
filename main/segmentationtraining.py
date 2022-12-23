@@ -21,7 +21,8 @@ height=256
 width=256
 Net=None
 batch_size=1
-optimizer=None 
+optimizer=None
+scheduler=None 
 logFilePath=None
 seed=41
 
@@ -164,21 +165,19 @@ def LoadNet(model,checkpoint):
 
 
 
-def trainStart(model, TrainFolder, ValidFolder,epochs, batchSize,TestFolder=None,Learning_Rate=1e-5, logName=None):
+def trainStart(model, TrainFolder, ValidFolder,epochs, batchSize,TestFolder=None,Learning_Rate=1e-5, logName=None,SchedulerName='Plateau'):
 	#log will not save test loss in this version
-	global plottable_data
-	global batch_size
-	global Net
-	global height
-	global width
-	global optimizer
-	global logFilePath
 	
+	global batch_size
 	batch_size=batchSize
 	vbatch_size=batchSize*4
 	ListImages=os.listdir(os.path.join(TrainFolder, "images")) # Create list of images		
 	vListImages=os.listdir(os.path.join(ValidFolder, "images")) # Create list of validation images
-	
+	unbatched=len(ListImages)%batch_size
+	batch_counts=round((len(ListImages)-unbatched)/batch_size)
+	vunbatched=len(vListImages)%vbatch_size
+	vbatch_counts=round((len(vListImages)-vunbatched)/vbatch_size)
+		
 	if TestFolder!=None: 
 		tbatch_size=batchSize*4
 		tListImages=os.listdir(os.path.join(TestFolder, "images")) # Create list of test images
@@ -186,21 +185,35 @@ def trainStart(model, TrainFolder, ValidFolder,epochs, batchSize,TestFolder=None
 		tbatch_counts=round((len(tListImages)-tunbatched)/tbatch_size)
 	else:
 		tbatch_counts=0
+
 	
+	
+	global Net
+	global scheduler
+	global optimizer
+	#load model 
+	Net = model # Load net
+	Net=Net.to(device)
+	model_naming_title=Netname(Net)
+	optimizer=torch.optim.Adam(params=Net.parameters(),lr=Learning_Rate) # Create adam optimizer
+	if SchedulerName=='Consine': scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,batch_counts)
+	else: scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+
+
 	#autodetect height and width of training tiles
+	global height
+	global width
 	tempImage=cv2.imread(os.path.join(TrainFolder, "images", ListImages[0]), cv2.IMREAD_COLOR)
 	height=tempImage.shape[0]
 	width=tempImage.shape[1]
 	del tempImage
 	
-	#load model 
-	Net = model # Load net
-	Net=Net.to(device)
-	model_naming_title=Netname(Net)
+
+	global logFilePath
+	global plottable_data
 	
 	t=datetime.now()
 	DateTime =str(t.hour)+str(t.minute)+"-"+str(t.day)+"-"+str(t.month)+"-"+str(t.year)
-
 	path='Models/'+model_naming_title+"-"+DateTime
 	del t
 	del DateTime
@@ -225,15 +238,6 @@ def trainStart(model, TrainFolder, ValidFolder,epochs, batchSize,TestFolder=None
 		EpochsStartFrom=0  #in case training is restarted from a previously saved epoch, this continues the sequence
 		# and prevents over-writing models and logs in the loss database 
 
-		optimizer=torch.optim.Adam(params=Net.parameters(),lr=Learning_Rate) # Create adam optimizer
-		scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
-
-		unbatched=len(ListImages)%batch_size
-		batch_counts=round((len(ListImages)-unbatched)/batch_size)
-		vunbatched=len(vListImages)%vbatch_size
-		vbatch_counts=round((len(vListImages)-vunbatched)/vbatch_size)
-		
-		trainingDetails(path,TrainFolder, batch_counts, ValidFolder, vbatch_counts, str(TestFolder),tbatch_counts, '0', epochs-1, finished=False)
  		
 	else: 
 		print("Log file for ",model_naming_title, " already present as: ", log_path)
@@ -243,7 +247,7 @@ def trainStart(model, TrainFolder, ValidFolder,epochs, batchSize,TestFolder=None
 		print("If you want to continue training please use the trainfromLast function instead")
 		return
 		
-		
+	trainingDetails(path,TrainFolder, batch_counts, ValidFolder, vbatch_counts, str(TestFolder) ,tbatch_counts, '0', epochs-1, finished=False)
 	#_________________________PREPERATION DONE_________________#
 	#_________________________TRAINING LOOP STARTS FROM HERE_________________#
 	with torch.autograd.set_detect_anomaly(False):
@@ -281,7 +285,10 @@ def trainStart(model, TrainFolder, ValidFolder,epochs, batchSize,TestFolder=None
          
 
 			train_loss=train_loss/(runs) # +1) #averages the loss on all batches
-			scheduler.step(train_loss)
+			if SchedulerName=='Consine':
+				scheduler.step()
+			else:
+				scheduler.step(train_loss)
         
 			#BEGIN Validation 
 			Net.eval()
@@ -362,8 +369,8 @@ def trainStart(model, TrainFolder, ValidFolder,epochs, batchSize,TestFolder=None
 					torch.save(Net.state_dict(),"./"+checkpoint)
 					print(" Saving LAST EPOCH: ./",checkpoint)
 			"""    
-			print(itr+EpochsStartFrom,"=> TrainLoss=",train_loss,"  ValLoss=", valid_loss,  "  valACC=",ValACC, " TestLoss=", test_loss," testACC=",testACC, " lr:", scheduler.state_dict()["_last_lr"][0], " Time:", duration.seconds)
-			new_log_entry=pd.DataFrame([[itr+EpochsStartFrom, train_loss, valid_loss,ValACC,test_loss,testACC, duration.seconds,float(scheduler.state_dict()["_last_lr"][0]),path,checkpoint]], columns=log_titles)
+			print(itr+EpochsStartFrom,"=> TrainLoss=",train_loss,"  ValLoss=", valid_loss,  "  valACC=",ValACC, " TestLoss=", test_loss," testACC=",testACC, " lr:",  GetLastLR(SchedulerName), " Time:", duration.seconds)
+			new_log_entry=pd.DataFrame([[itr+EpochsStartFrom, train_loss, valid_loss,ValACC,test_loss,testACC, duration.seconds,GetLastLR(SchedulerName),path,checkpoint]], columns=log_titles)
 			log_DB=pd.concat([log_DB, new_log_entry])
 			log_DB.to_csv(log_path, sep=",")
 			log_DB2=pd.concat([log_DB2, new_log_entry])
@@ -377,16 +384,30 @@ def trainStart(model, TrainFolder, ValidFolder,epochs, batchSize,TestFolder=None
 
 
  
-def trainFromLast(model, TrainFolder, ValidFolder, epochs, batchSize, TestFolder=None, Learning_Rate=0):
-	global plottable_data
-	global batch_size
+def trainFromLast(model, TrainFolder, ValidFolder, epochs, batchSize, TestFolder=None, Learning_Rate=0,SchedulerName='Plateau'):
 	global Net
+	global scheduler
 	global optimizer
-	global logFilePath
+	Net = model # Load net
+	Net=Net.to(device)
+	gc.collect()
+	cuda.empty_cache()
+	Net.load_state_dict(torch.load(checkpoint))  #if this gives an error check the training setup in previous 2 cells
+	optimizer=torch.optim.Adam(params=Net.parameters(),lr=Learning_Rate) # Create adam optimizer
+	if SchedulerName=='Consine':
+		scheduler=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,3)
+	else: 
+		scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+	
+	global batch_size
 	batch_size=batchSize
 	vbatch_size=batchSize*4
 	ListImages=os.listdir(os.path.join(TrainFolder, "images")) # Create list of images		
 	vListImages=os.listdir(os.path.join(ValidFolder, "images")) # Create list of validation images
+	unbatched=len(ListImages)%batch_size
+	batch_counts=round((len(ListImages)-unbatched)/batch_size)
+	vunbatched=len(vListImages)%vbatch_size
+	vbatch_counts=round((len(vListImages)-vunbatched)/vbatch_size)
 
 	if TestFolder!=None: 
 		tbatch_size=batchSize*4
@@ -404,12 +425,9 @@ def trainFromLast(model, TrainFolder, ValidFolder, epochs, batchSize, TestFolder
 	width=tempImage.shape[1]
 	del tempImage
 	
-	Net = model # Load net
-	Net=Net.to(device)
-	gc.collect()
-	cuda.empty_cache()
+	global plottable_data
+	global logFilePath
 	model_naming_title=Netname(Net)
-	
 	log_path='LOG for '+model_naming_title+'.csv'
 	logFilePath=log_path
 	log_titles=['Epoch','Train-Loss','Val-Loss', 'Val-Acc', 'Test-Loss','Test-Acc', 'Time','Learn-Rate','Session','CheckPoint']
@@ -456,19 +474,10 @@ def trainFromLast(model, TrainFolder, ValidFolder, epochs, batchSize, TestFolder
 		print(" Either restore the log file, pass a different model_naming_title to trainFromLast() , or start training from scratch with trainStart() ")
 		return
 	#_________________________PREPERATION DONE_________________#
-	Net.load_state_dict(torch.load(checkpoint))  #if this gives an error check the training setup in previous 2 cells
-	optimizer=torch.optim.Adam(params=Net.parameters(),lr=Learning_Rate) # Create adam optimizer
-	scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
-    
 	
 	model_naming_title="-"+model_naming_title+".torch"
 	#log_path2="./"+path+'/LOG for '+path+'.csv'
 	log_DB2=pd.read_csv(log_path2, sep=",", index_col=0)
-            
-	unbatched=len(ListImages)%batch_size
-	batch_counts=round((len(ListImages)-unbatched)/batch_size)
-	vunbatched=len(vListImages)%vbatch_size
-	vbatch_counts=round((len(vListImages)-vunbatched)/vbatch_size)
 
 	trainingDetails(path,TrainFolder, batch_counts, ValidFolder, vbatch_counts, str(TestFolder),tbatch_counts, checkpoint, EpochsStartFrom+epochs, finished=False)
 	#_________________________TRAINING STARTS FROM HERE_________________#
@@ -506,7 +515,10 @@ def trainFromLast(model, TrainFolder, ValidFolder, epochs, batchSize, TestFolder
 			"""
 
 			train_loss=train_loss/(runs) # +1) #averages the loss on all batches
-			scheduler.step(train_loss)
+			if SchedulerName=='Consine':
+				scheduler.step()
+			else:
+				scheduler.step(train_loss)
 			print(itr+EpochsStartFrom,"=> TrainLoss=",train_loss)
 			#BEGIN Validation 
 			
@@ -590,16 +602,16 @@ def trainFromLast(model, TrainFolder, ValidFolder, epochs, batchSize, TestFolder
 					torch.save(Net.state_dict(),"./"+checkpoint)
 					print(" Saving LAST EPOCH: ./",checkpoint)
 			"""    
-			print("lr:", scheduler.state_dict()["_last_lr"][0], "  Time:", duration.seconds)
+			print("lr:", GetLastLR(SchedulerName), "  Time:", duration.seconds)
 			#new_log_entry=pd.DataFrame([[itr+EpochsStartFrom, train_loss, valid_loss,ValACC, float(scheduler.state_dict()["_last_lr"][0]),path,checkpoint]], columns=log_titles)
-			new_log_entry=pd.DataFrame([[itr+EpochsStartFrom, train_loss, valid_loss,ValACC,test_loss,testACC, duration.seconds , float(scheduler.state_dict()["_last_lr"][0]),path,checkpoint]], columns=log_titles)
+			new_log_entry=pd.DataFrame([[itr+EpochsStartFrom, train_loss, valid_loss,ValACC,test_loss,testACC, duration.seconds , GetLastLR(SchedulerName),path,checkpoint]], columns=log_titles)
 			log_DB=pd.concat([log_DB, new_log_entry])
 			log_DB.to_csv(log_path, sep=",")
 			log_DB2=pd.concat([log_DB2, new_log_entry])
 			log_DB2.to_csv(log_path2, sep=",")
 
 	#_________________________TRAINING LOOP ENDS HERE_________________#
-	trainingDetails(path,TrainFolder, batch_counts, ValidFolder, vbatch_counts, str(TestFolder),tbatch_counts, str(EpochsStartFrom), checkpoint, finished=True)
+	trainingDetails(path,TrainFolder, batch_counts, ValidFolder, vbatch_counts, str(TestFolder) ,tbatch_counts, str(EpochsStartFrom), checkpoint, finished=True)
 	plottable_data =log_DB
 	print("____FINISHED Training______")
 	return log_DB
@@ -892,7 +904,7 @@ def GenerateLog(model,CheckpointFolder,TrainFolder,ValidFolder,TestFolder=None,b
 	
 	i=0
 	for c in CheckPointList:
-	
+		print("Evaluating Checkpoint: ", str(c))
 		Net.load_state_dict(torch.load('./'+CheckpointFolder+'/'+c))
 		Net.eval()
 		gc.collect()
@@ -1098,6 +1110,8 @@ def trainingDetails(folder,train, batches, val, vbatches, test, tbatches, start,
 	global height
 	global width
 	global batch_size
+	global scheduler
+	global optimizer
 	
 	t=datetime.now()
 	DateTime =str(t.hour)+str(t.minute)+"-"+str(t.day)+"-"+str(t.month)+"-"+str(t.year)
@@ -1112,6 +1126,8 @@ def trainingDetails(folder,train, batches, val, vbatches, test, tbatches, start,
 		f.write(str(Net))
 		f.write('\n')
 		f.write('Seed: '+str(seed)+'\n')
+		f.write('Scheduler:' +str(scheduler)+'\n')
+		f.write('Optimizer:' +str(optimizer)+'\n')
 		f.write('Train: '+str(train)+'  Batches: '+str(batches)+'\n')
 		f.write('Val: '+str(val)+'  Batches: '+str(vbatches)+'\n')
 		f.write('Test: '+str(test)+'  Batches: '+str(tbatches)+'\n')
@@ -1142,6 +1158,15 @@ def trainFromPoint(Net, TrainFolder, ValidFolder,epochs, batch_size, checkpoint_
 
 
 """
+
+def GetLastLR(SchedulerName):
+	global scheduler
+	if SchedulerName=='Plateau':
+		last_lr=scheduler.state_dict()["_last_lr"][0]
+	else:
+		last_lr=scheduler.get_last_lr()
+		
+	return float(last_lr)
 
 def OLDtrainStart(model, TrainFolder, ValidFolder,epochs, batchSize,TestFolder=None,Learning_Rate=1e-5):
 	#log will not save test loss in this version
@@ -1334,7 +1359,7 @@ def OLDtrainStart(model, TrainFolder, ValidFolder,epochs, batchSize,TestFolder=N
 					torch.save(Net.state_dict(),"./"+checkpoint)
 					print(" Saving LAST EPOCH: ./",checkpoint)
 			"""    
-			print(itr+EpochsStartFrom,"=> TrainLoss=",train_loss,"  ValLoss=", valid_loss,  "ACC=",ValACC, "lr:", scheduler.state_dict()["_last_lr"][0], " Time:", duration.seconds)
+			print(itr+EpochsStartFrom,"=> TrainLoss=",train_loss,"  ValLoss=", valid_loss,  "ACC=",ValACC, "lr:",  GetLastLR(SchedulerName) , " Time:", duration.seconds)
 			new_log_entry=pd.DataFrame([[itr+EpochsStartFrom, train_loss, valid_loss,ValACC, float(scheduler.state_dict()["_last_lr"][0]),path,checkpoint]], columns=log_titles)
 			log_DB=pd.concat([log_DB, new_log_entry])
 			log_DB.to_csv(log_path, sep=",")
