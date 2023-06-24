@@ -879,130 +879,134 @@ def ProducePred(Net, image_file_path, label_file_path ,tilesize=3200, save_name=
 	return image
 
 def ArgmaxMC(Net, image_file_path, label_file_path,tilesize=3200,  singleclass=10, save_name='Argmax'):
-	global blanks
-	global grayscale
-	image, Lbl, blank, xMoves, yMoves, striderX, striderY,height, width,newHeight,newWidth=prepareImages(image_file_path, label_file_path,  tilesize) 
+    global blanks
+    global grayscale
+    
+    gc.collect()
+    cuda.empty_cache()
+    image, Lbl, blank, xMoves, yMoves, striderX, striderY,height, width,newHeight,newWidth=prepareImages(image_file_path, label_file_path,  tilesize) 
 
-	gc.collect()
-	cuda.empty_cache()
+    torch.set_default_tensor_type('torch.cuda.FloatTensor') #puts all tensors on GPU by default
 
-	torch.set_default_tensor_type('torch.cuda.FloatTensor') #puts all tensors on GPU by default
-
-	Net.eval()
-	print("Generating Correct Map for mutliclass ")
-	for j in tqdm(range(int(yMoves))):
+    Net.eval()
+    print("Generating Correct Map for mutliclass ")
+    for j in tqdm(range(int(yMoves))):
 		#print ("\n row:", j, end="|")
-		for i in range(int(xMoves)):
+        for i in range(int(xMoves)):
 			#print (" col:", i, end=" ")
 			#print("height from ",(j*striderY),"to row",(j*striderY)+striderY, "col ",i*striderX,"to ",(i*striderX)+striderX)
-			segment=image[j*striderY:(j*striderY)+striderY, i*striderX:(i*striderX)+striderX ]
-			label=Lbl[j*striderY:(j*striderY)+striderY, i*striderX:(i*striderX)+striderX ]
-        
-			with torch.no_grad():
-				if grayscale:
-					segment=cv2.cvtColor(segment, cv2.COLOR_BGR2GRAY)
-					segment=transformGrayscaleImg(segment)
-				else:
-					segment=transformImg(segment)
-				
-				segment=torch.autograd.Variable(segment, requires_grad=False).to(device).unsqueeze(0) # Load image
-				Pred=Net(segment)
-			del segment
-			#gc.collect()
-			#cuda.empty_cache()
-       
-			# Pred=Pred[0][1]   #original code that worked instead of if else
-			#print(' Pred Shape: ', Pred.shape, ' --->', end=' ')
- 
-			Pred=torch.argmax(Pred[0], dim=0)  
-			
-			#label=(label/10)
-			label= torch.from_numpy(label).to(device)
-			label=label==singleclass
-			
-			Pred=Pred==(singleclass/10)
-			
-			match=torch.eq(Pred,label)
-			del Pred
-			gc.collect()
-			cuda.empty_cache()
-			match=match.to(device)
-			
-			#label=label!=0
- 
-			map= torch.zeros((striderY,striderX,3),dtype=torch.int8).to(device)
-    
-			"""
-			P predict
-			L label
-			Q where equal (true p and true n)
-	
-			L and Q = where L is true and P matchs  (True Positives)  turn to 255 and call it green
-			not L and Q = True Negatives 
-			L and notQ = L is true but no match (False Negative) turn to 255 and call it Blue
-			notL and Not Q = L is false and L+P do no match = False positives turn to 255 and call it Red
+            segment=image[j*striderY:(j*striderY)+striderY, i*striderX:(i*striderX)+striderX ]
+            label=Lbl[j*striderY:(j*striderY)+striderY, i*striderX:(i*striderX)+striderX ]
 
-			Blue=torch.logical_and(label,torch.logical_not(Pred), out=torch.empty((striderX,striderY), dtype=torch.int8) )
-			Green= torch.logical_and(label,Pred, out=torch.empty((striderX,striderY), dtype=torch.int8))
-			Red=torch.logical_and(torch.logical_not(label),torch.logical_not(Pred), out=torch.empty((striderX,striderY), dtype=torch.int8)) 
-			"""
+            with torch.no_grad():
+                if grayscale:
+                    segment=cv2.cvtColor(segment, cv2.COLOR_BGR2GRAY)
+                    segment=transformGrayscaleImg(segment)
+                else:
+                    segment=transformImg(segment)
                 
-			map[:,:,0]=torch.logical_and(label,torch.logical_not(match), out=torch.empty((striderY,striderX), dtype=torch.int8) )
-			map[:,:,1]=torch.logical_and(label,match, out=torch.empty((striderY,striderX), dtype=torch.int8))
-			map[:,:,2]=torch.logical_and(torch.logical_not(label),torch.logical_not(match), out=torch.empty((striderY,striderX), dtype=torch.int8))
-          
-			b=blank[j*striderY:(j*striderY)+striderY, i*striderX:(i*striderX)+striderX ]
-			b=torch.from_numpy(b).to(device)
-			map[:,:,0]=map[:,:,0]*b
-			map[:,:,1]=map[:,:,1]*b
-			map[:,:,2]=map[:,:,2]*b
-        
-			del b
-			gc.collect()
-			cuda.empty_cache()
-         
-			map=map*254
-			map=map.cpu().detach().numpy()
+                segment=torch.autograd.Variable(segment, requires_grad=False).to(device).unsqueeze(0) # Load image
+                Pred=Net(segment)
+            del segment
+            #gc.collect()
+            #cuda.empty_cache()
 
-			image[j*striderY:(j*striderY)+striderY, i*striderX:(i*striderX)+striderX]=copy.deepcopy(map)    
-			# END   Generating Confusion Matrix Map
-         
-			del map
-			gc.collect()
-			cuda.empty_cache()
+            # Pred=Pred[0][1]   #original code that worked instead of if else
+            #print(' Pred Shape: ', Pred.shape, ' --->', end=' ')
+
+            Pred=torch.argmax(Pred[0], dim=0)  
+
+            #label=(label/10)
+            label= torch.from_numpy(label).to(device)
+            label=label==singleclass
+
+            Pred=Pred==(singleclass/10)
+
+            match=torch.eq(Pred,label)
+            del Pred
+            gc.collect()
+            cuda.empty_cache()
+            match=match.to(device)
+
+            #label=label!=0
+
+            map= torch.zeros((striderY,striderX,3),dtype=torch.int8).to(device)
+
+            """
+            P predict
+            L label
+            Q where equal (true p and true n)
+
+            L and Q = where L is true and P matchs  (True Positives)  turn to 255 and call it green
+            not L and Q = True Negatives 
+            L and notQ = L is true but no match (False Negative) turn to 255 and call it Blue
+            notL and Not Q = L is false and L+P do no match = False positives turn to 255 and call it Red
+
+            Blue=torch.logical_and(label,torch.logical_not(Pred), out=torch.empty((striderX,striderY), dtype=torch.int8) )
+            Green= torch.logical_and(label,Pred, out=torch.empty((striderX,striderY), dtype=torch.int8))
+            Red=torch.logical_and(torch.logical_not(label),torch.logical_not(Pred), out=torch.empty((striderX,striderY), dtype=torch.int8)) 
+            """
+                
+            map[:,:,0]=torch.logical_and(label,torch.logical_not(match), out=torch.empty((striderY,striderX), dtype=torch.int8) )
+            map[:,:,1]=torch.logical_and(label,match, out=torch.empty((striderY,striderX), dtype=torch.int8))
+            map[:,:,2]=torch.logical_and(torch.logical_not(label),torch.logical_not(match), out=torch.empty((striderY,striderX), dtype=torch.int8))
+
+            b=blank[j*striderY:(j*striderY)+striderY, i*striderX:(i*striderX)+striderX ]
+            b=torch.from_numpy(b).to(device)
+            map[:,:,0]=map[:,:,0]*b
+            map[:,:,1]=map[:,:,1]*b
+            map[:,:,2]=map[:,:,2]*b
+
+            del b
+            gc.collect()
+            cuda.empty_cache()
+
+            map=map*254
+            map=map.cpu().detach().numpy()
+
+            image[j*striderY:(j*striderY)+striderY, i*striderX:(i*striderX)+striderX]=copy.deepcopy(map)    
+            # END   Generating Confusion Matrix Map
+
+            del map
+            gc.collect()
+            cuda.empty_cache()
 	
 	
-	image=image[0:height, 0:width]
-	image.shape
-	print (save_name," | ", image.shape, " | Saved Successfully= ", cv2.imwrite(save_name+'.png',image))
+    image=image[0:height, 0:width]
+    image.shape
+    print (save_name," | ", image.shape, " | Saved Successfully= ", cv2.imwrite(save_name+'.png',image))
 
-	del Lbl
-	del blank
+    del Lbl
+    del blank
 
-	gc.collect()
-	#image=cv2.imread('512 A5 confMat.png', cv2.IMREAD_COLOR)
-	image=torch.from_numpy(image).to(device)
- 
-	#Generate Results
-	imagesize=(height*width)-blanks
-	fn=torch.count_nonzero(image[:,:,0])
-	tp=torch.count_nonzero(image[:,:,1])
-	fp=torch.count_nonzero(image[:,:,2])
-	tn=imagesize-(fn+tp+fp)
+    gc.collect()
+    #image=cv2.imread('512 A5 confMat.png', cv2.IMREAD_COLOR)
+    image=torch.from_numpy(image).to(device)
 
-	acc= ((tp+tn))/imagesize 
+    #Generate Results
+    imagesize=(height*width)-blanks
+    fn=torch.count_nonzero(image[:,:,0])
+    tp=torch.count_nonzero(image[:,:,1])
+    fp=torch.count_nonzero(image[:,:,2])
+    tn=imagesize-(fn+tp+fp)
+
+    acc= ((tp+tn))/imagesize 
 
 
-	#Output Result
-	print("TP:",int(tp),"  FP:",int(fp))
-	print("FN:",int(fn),"  TN:",int(tn))
+    #Output Result
+    print("TP:",int(tp),"  FP:",int(fp))
+    print("FN:",int(fn),"  TN:",int(tn))
 
-	print("\nCorrect  :",int((tp+tn))," =", float(((tp+tn)/imagesize)*100),"%")
-	print("Incorrect:",int((fp+fn))," =",float(((fp+fn)/imagesize)*100),"%")
+    print("\nCorrect  :",int((tp+tn))," =", float(((tp+tn)/imagesize)*100),"%")
+    print("Incorrect:",int((fp+fn))," =",float(((fp+fn)/imagesize)*100),"%")
 
-	print("\nAccuracy:", round(float(acc*100),3),"%" )
+    print("\nAccuracy:", round(float(acc*100),3),"%" )
 
-	return int(tp),int(fp),int(fn),int(tn)
+    del image
+    gc.collect()
+    cuda.empty_cache()
+
+    return int(tp),int(fp),int(fn),int(tn)
 
 
 
