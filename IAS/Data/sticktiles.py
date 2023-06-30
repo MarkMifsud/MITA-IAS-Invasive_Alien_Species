@@ -91,7 +91,7 @@ import matplotlib.pyplot as plt
 
 labels_exist = False
 for i in range(0, 4):
-    path = ".\\" + folder + "\\lables\\00000000000" + str(i) + ".tif"
+    path = ".\\" + folder + "\\labels\\00000000000" + str(i) + ".tif"
     if os.path.exists(path):
         labels_exist = True
 

@@ -20,23 +20,25 @@ import numpy as np
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
+model_output_size = 7
 
-transformImg= tf.Compose([tf.ToPILImage(),tf.ToTensor(),tf.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]) ]) #function to adapt image
-tensorize=tf.ToTensor()
+transformImg = tf.Compose([tf.ToPILImage(),tf.ToTensor(),tf.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]) ]) #function to adapt image
+tensorize = tf.ToTensor()
 
-transformGrayscaleImg= tf.Compose([tf.ToPILImage(),tf.ToTensor()]) #function to adapt image
+transformGrayscaleImg = tf.Compose([tf.ToPILImage(),tf.ToTensor()]) #function to adapt image
 
-blanks=0  #the number of pixels outside the raster area of interest
-grayscale=False
+blanks = 0  #the number of pixels outside the raster area of interest
+grayscale = False
 
-height=0
-width=0
-xMoves=0
-yMoves=0
-striderX=0
-striderY=0
-newHeight=0
-newWidth=0
+height = 0
+width = 0
+xMoves = 0
+yMoves = 0
+striderX = 0
+striderY = 0
+newHeight = 0
+newWidth = 0
+fileName = 'None'  # the name of the image / label or related image being processed
 
 
 def LoadNet(model,checkpoint):
@@ -90,6 +92,8 @@ def prepareImagesAllClasses(image_file_path,label_file_path, tilesize, ignoreLab
     image = cv2.imread(image_file_path, cv2.IMREAD_UNCHANGED)
     if type(image)!=type(None):
         print("processing Image...")
+        global fileName
+        fileName = image_file_path.split('/')[-1]
     else:
         print("Image not found")
         return
@@ -264,27 +268,40 @@ def ArgmaxMapOnly(Net, image_file_path, tilesize=1600, save_name=None):
     return  ArgmaxMap
 
 
-def Pred2Result(Pred, Lbl, save_as):
-    conf_matrix=torch.zeros([7,7])
+def Pred2Result(Pred, Lbl, save_as, use_exclusion_map=True):
+    global model_output_size
+    conf_matrix=torch.zeros([model_output_size , model_output_size])
 
     ArgmaxMap= np.zeros((Lbl.shape[0],Lbl.shape[1]),dtype=np.int8)
+
+    global fileName  # now we check if an exclusion map exists and if yes we apply it to the result
+    if use_exclusion_map is True and os.path.exists(".\\Data\\source\\exclusions\\" + fileName):
+        exclusion = cv.imread(".\\Data\\source\\exclusions\\" + fileName, cv2.COLOR_BGR2GRAY)
+        exclusion_map = (exclusion == 0)
+        del exclusion
+        gc.collect()
+    else:
+        use_exclusion_map = False
+
     
     for row in tqdm(range(Lbl.shape[0])): #for all rows, pixels in each row are processed in parallel
         label=Lbl[row]
 
         pred=Pred[:,row][:]
         pred=torch.argmax(pred, dim=0) #argmax prediction for the row
-        
-    
-        for i in range(7):  #labels
+        if use_exclusion_map is True:
+            pred = pred * torch.from_numpy(exclusion_map[row]).to(device) 
+
+        for i in range(model_output_size):  #labels
             tempLabel=label==i
-            for j in range(7):  #predictions
+            for j in range(model_output_size):  #predictions
                 tempPred=pred==j
                 match=torch.logical_and(torch.from_numpy(tempLabel).to(device),tempPred)
+
                 conf_matrix[i,j]=conf_matrix[i,j]+torch.count_nonzero(match)
         
         ArgmaxMap[row]=pred.cpu().detach().numpy()
-        
+
     blankpixels=int(blanks)
     conf_matrix[0,0]=conf_matrix[0,0]-blankpixels # subtraction compensates for non raster pixels
 
@@ -358,6 +375,12 @@ def Argmax2Output(ArgmaxMap,save_as='Species Detection'):
             
       
     map=map.cpu().detach().numpy()
+
+    global fileName  # now we check if an exclusion map exists and if yes we apply it to the result
+    if use_exclusion_map is True and os.path.exists(".\\Data\\source\\exclusions\\" + fileName):
+        exclusionMap=cv.imread(".\\Data\\source\\exclusions\\" + fileName, cv2.COLOR_BGR2GRAY)
+        exclusionMap = (exclusionMap == 0)
+        map = map*exclusionMap
     
     cv2.imwrite(save_as+'.tif', map)
     print(save_as+'.tif  SAVED')
