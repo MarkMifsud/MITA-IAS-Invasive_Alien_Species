@@ -532,7 +532,7 @@ def trainFromLast(model, TrainFolder, ValidFolder, epochs, batchSize, TrainOnCla
             print("Folder for checkpoints: ", path, " or Models/" + path + " were not found.  Training cannot continue")
             del epochs
             print(
-                " Please restore the folder and restart this notebook, or start training from scratch in appropriate notebook")
+                " Please restore the folder and restart this notebook, or start training from scratch by manually deleting the older log")
             return
 
         if os.path.exists("./" + LastCheckpoint[0]):

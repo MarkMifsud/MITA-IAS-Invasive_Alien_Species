@@ -18,15 +18,8 @@ import ipywidgets as widgets
 
 input_layers_count = 3
 classes_count = 7
-
-
-model = smp.UnetPlusPlus(
-    encoder_name="resnet152",  # choose encoder, e.g. mobilenet_v2 or efficientnet-b7
-    encoder_weights="imagenet",  # use None or `imagenet` pre-trained weights for encoder initialization
-    in_channels=input_layers_count,  # model input channels (1 for gray-scale images, 3 for RGB, etc.)
-    classes=classes_count,  # model output channels (number of classes in your dataset, add +1 for background)
-    activation='softmax',  # deprecated for some models.  Last activation is self(x)
-)
+model = None
+usable_models_directory = ".\\Models\\_usable\\"
 
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -50,7 +43,28 @@ Start = widgets.Button(description='Start Detection', disabled=False,
 
 def DetectionLoop(b):
     global Start
+    global usable_models_directory
+    ListModels = os.listdir(usable_models_directory)
+    if len(ListModels)==0:
+        Start.close()
+        print("No single class models were found inside the folder ", usable_models_directory )
+        return
+
     Start.close()
+
+    global input_layers_count
+    global classes_count
+    global model
+
+    if model is None:
+        model = smp.UnetPlusPlus(
+            encoder_name="resnet152",  # choose encoder, e.g. mobilenet_v2 or efficientnet-b7
+            encoder_weights="imagenet",  # use None or `imagenet` pre-trained weights for encoder initialization
+            in_channels=input_layers_count,  # model input channels (1 for gray-scale images, 3 for RGB, etc.)
+            classes=classes_count,  # model output channels (number of classes in your dataset, add +1 for background)
+            activation='softmax',  # deprecated for some models.  Last activation is self(x)
+        )
+
     ListRasters = os.listdir(".\\Data\\source\\rasters")
     Rasterbox = widgets.Select(
         options=ListRasters,
@@ -59,7 +73,7 @@ def DetectionLoop(b):
         description='Raster:',
         disabled=False)
 
-    ListModels = os.listdir(".\\Models\\_usable\\")  # checkpoints that are deemed usable for detection
+    ListModels = os.listdir(usable_models_directory)  # checkpoints that are deemed usable for detection
     Modelbox = widgets.Select(
         options=ListModels,
         value=ListModels[0],
@@ -82,23 +96,45 @@ def DetectionLoop(b):
     def on_button_clicked(b):
         print("Loading data and model...", end=" ")
         global Net
+        global usable_models_directory
         tile_size = Tilebox.value
         file = Rasterbox.value
         epoch = Modelbox.value
-        epoch = ".\\Models\\_usable\\" + epoch
+        epoch = usable_models_directory + epoch
         save_as = Savebox.value
         save_as = '.\\Results\\' + save_as
         raster = '.\\Data\\source\\rasters\\' + file
+
+        row1.close()
+        row2.close()
+        Tilebox.close()
+        Accept.close()
+
+        global model
+        try:   # this is used to detect the model's output size
+            # however, this correction forces a Unet++Resnet152,
+            # so it bugs out if a different model encounters this exception.
+            model.load_state_dict(torch.load(epoch))
+        except Exception as error:
+            # handle the exception
+            #print(error)
+            #print (str(error).split("shape torch.Size([")) #.split(",")[0] )
+            detect_output_size = int(str(error).split("shape torch.Size([")[1].split(",")[0])
+            global input_layers_count
+            model = smp.UnetPlusPlus(
+                encoder_name="resnet152",
+                encoder_weights="imagenet",
+                in_channels=input_layers_count,
+                classes=detect_output_size,
+                activation='softmax')
+
         Net = model.to(device)
         Net.load_state_dict(torch.load(epoch))
 
         ArgmaxMap = vis2.ArgmaxMapOnly(Net, raster, tilesize=tile_size)
         vis2.Argmax2Output(ArgmaxMap, save_as=save_as)
-        row1.close()
-        row2.close()
-        Tilebox.close()
-        Accept.close()
-        Net = model.to(device)
+
+        #Net = model.to(device)
         del ArgmaxMap
         gc.collect()
         cuda.empty_cache()

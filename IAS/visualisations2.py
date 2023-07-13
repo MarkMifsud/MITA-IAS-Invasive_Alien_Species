@@ -20,7 +20,16 @@ import numpy as np
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-model_output_size = 7
+classes_count = 7
+use_exclusion_map = True
+grayscale = False
+single_class_mode = False  # if false, detection operates on Multiclass
+single_class_species = 1   # if operating on single class this is the class being detected
+
+# the following palette shows the colour for each class up to 11 variations
+# you will have to add more colours if you want to detect more species than 9
+# these colours are in BGR (blue, green, red) format; not RGB
+palette = [ [0,0,0], [0,200,0], [0,0,240], [120, 32,32], [254, 0, 254], [128,0, 128], [0,255,255], [255,120,120], [30,156,245,], [236,175,255], [255,254,60] ]
 
 transformImg = tf.Compose([tf.ToPILImage(),tf.ToTensor(),tf.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]) ]) #function to adapt image
 tensorize = tf.ToTensor()
@@ -28,7 +37,7 @@ tensorize = tf.ToTensor()
 transformGrayscaleImg = tf.Compose([tf.ToPILImage(),tf.ToTensor()]) #function to adapt image
 
 blanks = 0  #the number of pixels outside the raster area of interest
-grayscale = False
+
 
 height = 0
 width = 0
@@ -45,6 +54,8 @@ def LoadNet(model,checkpoint):
     Net = model # Load net
     Net=Net.to(device)
     Net.load_state_dict(torch.load(checkpoint))
+    global classes_count
+    classes_count = int(str(Net.segmentation_head).split("Conv2d(16,")[1].split(",")[0])
     return Net
 
 
@@ -149,7 +160,11 @@ def prepareImagesAllClasses(image_file_path,label_file_path, tilesize, ignoreLab
             print("Label not found")
             return image, blank
 
-        Lbl=Lbl/10
+        Lbl = Lbl/10
+        global single_class_mode
+        global single_class_species
+        if single_class_mode is True:
+            Lbl = Lbl == single_class_species
         Lbl=Lbl.astype(np.uint8)
         Lbl = cv2.copyMakeBorder(Lbl, 0, addPixelsY, 0, addPixelsX,cv2.BORDER_CONSTANT, value=[0])
         print(image.shape,' ',Lbl.shape)
@@ -166,7 +181,8 @@ def PredictAllClasses(Net, image, blank, xMoves, yMoves, striderX, striderY, hei
     gc.collect()
     cuda.empty_cache()
 
-
+    global classes_count
+    classes_count = int(str(Net.segmentation_head).split("Conv2d(16,")[1].split(",")[0])
 
     Net.eval()
     with torch.no_grad():
@@ -268,14 +284,35 @@ def ArgmaxMapOnly(Net, image_file_path, tilesize=1600, save_name=None):
     return  ArgmaxMap
 
 
-def Pred2Result(Pred, Lbl, save_as, use_exclusion_map=True):
-    global model_output_size
-    conf_matrix=torch.zeros([model_output_size , model_output_size])
+def Pred2Result(Pred, Lbl, save_as ):
+    global classes_count
+    class_names = ('None', 'Arundo', 'Opuntia', 'Agri', 'Eucalyp', 'Agave', 'Acacia')
+    global single_class_mode
+    if single_class_mode is True:
+        class_names = ('None', 'Class')
+        classes_count = 2
+
+    if classes_count == 8:
+        class_names = ('None', 'Arundo', 'Opuntia', 'Agri', 'Eucalyp', 'Agave', 'Acacia', 'Prinjol')
+
+    if classes_count > 8:
+        print(
+            "Number of species beyond that planned originally, if this part of the app crashes contact the programmer")
+        class_names_list = list(class_names)
+        remaining = classes_count - 8
+        for r in range(remaining + 1):
+            class_names_list.append('Class' + str(r))
+        class_names = tuple(class_names_list)
+
+
+    conf_matrix=torch.zeros([classes_count , classes_count])
 
     ArgmaxMap= np.zeros((Lbl.shape[0],Lbl.shape[1]),dtype=np.int8)
 
     global fileName  # now we check if an exclusion map exists and if yes we apply it to the result
-    if use_exclusion_map is True and os.path.exists(".\\Data\\source\\exclusions\\" + fileName):
+
+    if os.path.exists(".\\Data\\source\\exclusions\\" + fileName):
+        use_exclusion_map = True
         exclusion = cv.imread(".\\Data\\source\\exclusions\\" + fileName, cv2.COLOR_BGR2GRAY)
         exclusion_map = (exclusion == 0)
         del exclusion
@@ -292,9 +329,9 @@ def Pred2Result(Pred, Lbl, save_as, use_exclusion_map=True):
         if use_exclusion_map is True:
             pred = pred * torch.from_numpy(exclusion_map[row]).to(device) 
 
-        for i in range(model_output_size):  #labels
+        for i in range(classes_count):  #labels
             tempLabel=label==i
-            for j in range(model_output_size):  #predictions
+            for j in range(classes_count):  #predictions
                 tempPred=pred==j
                 match=torch.logical_and(torch.from_numpy(tempLabel).to(device),tempPred)
 
@@ -305,13 +342,14 @@ def Pred2Result(Pred, Lbl, save_as, use_exclusion_map=True):
     blankpixels=int(blanks)
     conf_matrix[0,0]=conf_matrix[0,0]-blankpixels # subtraction compensates for non raster pixels
 
-    class_names = ('None', 'Arundo', 'Opuntia', 'Agri','Eucalyp', 'Agave', 'Acacia')
-    conf_matrix=conf_matrix.type(torch.int32).cpu().detach().numpy()
+    conf_matrix = conf_matrix.type(torch.int32).cpu().detach().numpy()
 
     # Create pandas dataframe
     dataframe = pd.DataFrame(conf_matrix, index=class_names, columns=class_names)
     dataframe.to_excel(save_as+".xlsx")
-    cv2.imwrite('Argmax-'+save_as+'.png',ArgmaxMap)
+    cv2.imwrite('Argmax-'+save_as+'.png', ArgmaxMap)
+
+
     
     return dataframe, ArgmaxMap
 
@@ -359,11 +397,12 @@ def Argmax2Output(ArgmaxMap,save_as='Species Detection'):
     W=ArgmaxMap.shape[1]
     ArgmaxMap=torch.from_numpy(ArgmaxMap)
     map= torch.zeros((H,W,3),dtype=torch.uint8).to(device)
+
+    global palette
+
+    channels = [0,1,2]
     
-    palette= [[0,0,0],[0, 200, 0], [0,0,240], [120, 32,32], [254, 0, 254],[128,0, 128], [0,255,255]]
-    channels=[0,1,2]
-    
-    torch.where(ArgmaxMap==3,0,ArgmaxMap)
+    torch.where(ArgmaxMap==3,0,ArgmaxMap)  # excludes class 3 from showing up
     map[:,:,0]=ArgmaxMap
     map[:,:,1]=ArgmaxMap
     map[:,:,2]=ArgmaxMap
@@ -377,7 +416,8 @@ def Argmax2Output(ArgmaxMap,save_as='Species Detection'):
     map=map.cpu().detach().numpy()
 
     global fileName  # now we check if an exclusion map exists and if yes we apply it to the result
-    if use_exclusion_map is True and os.path.exists(".\\Data\\source\\exclusions\\" + fileName):
+
+    if os.path.exists(".\\Data\\source\\exclusions\\" + fileName):
         exclusionMap=cv.imread(".\\Data\\source\\exclusions\\" + fileName, cv2.COLOR_BGR2GRAY)
         exclusionMap = (exclusionMap == 0)
         map = map*exclusionMap
@@ -387,6 +427,7 @@ def Argmax2Output(ArgmaxMap,save_as='Species Detection'):
     del map
     gc.collect()
     cuda.empty_cache()
+
     return
 
 
@@ -424,7 +465,7 @@ def PaddedPredictionWithLabel(Net, image_file_path,label_file_path, tilesize=160
 
 
 
-def HeatMapFromPrediction(result ,CutoffPoint=0):
+def HeatMapFromPrediction(result ,CutoffPoint=0):  #deprecated
     # takes a single class prediction (result) and outputs a heatmap
 
     global blanks  #a number of blanks
