@@ -15,6 +15,9 @@ from tqdm import tqdm
 from torch import cuda
 from segmentation_models_pytorch.metrics.functional import accuracy as acc
 import ipywidgets as widgets
+from IPython.display import display
+from IPython.display import clear_output
+out = widgets.Output()
 
 input_layers_count = 3
 classes_count = 7
@@ -42,15 +45,17 @@ Start = widgets.Button(description='Start Detection', disabled=False,
 
 
 def DetectionLoop(b):
+    with out:
+        clear_output()
     global Start
     global usable_models_directory
     ListModels = os.listdir(usable_models_directory)
-    if len(ListModels)==0:
-        Start.close()
-        print("No single class models were found inside the folder ", usable_models_directory )
+    if len(ListModels) == 0:
+        # Start.close()
+        print("No single class models were found inside the folder ", usable_models_directory)
         return
 
-    Start.close()
+    # Start.close()
 
     global input_layers_count
     global classes_count
@@ -94,15 +99,18 @@ def DetectionLoop(b):
                             icon='check')
 
     def on_button_clicked(b):
-        print("Loading data and model...", end=" ")
+
+        with out:
+            clear_output()
+            print("Loading data and model...", end=" ")
         global Net
         global usable_models_directory
         tile_size = Tilebox.value
         file = Rasterbox.value
         epoch = Modelbox.value
         epoch = usable_models_directory + epoch
-        save_as = Savebox.value
-        save_as = '.\\Results\\' + save_as
+        save_name = Savebox.value
+        save_as = '.\\Results\\' + save_name
         raster = '.\\Data\\source\\rasters\\' + file
 
         row1.close()
@@ -111,14 +119,14 @@ def DetectionLoop(b):
         Accept.close()
 
         global model
-        try:   # this is used to detect the model's output size
+        try:  # this is used to detect the model's output size
             # however, this correction forces a Unet++Resnet152,
             # so it bugs out if a different model encounters this exception.
             model.load_state_dict(torch.load(epoch))
         except Exception as error:
             # handle the exception
-            #print(error)
-            #print (str(error).split("shape torch.Size([")) #.split(",")[0] )
+            # print(error)
+            # print (str(error).split("shape torch.Size([")) #.split(",")[0] )
             detect_output_size = int(str(error).split("shape torch.Size([")[1].split(",")[0])
             global input_layers_count
             model = smp.UnetPlusPlus(
@@ -131,26 +139,35 @@ def DetectionLoop(b):
         Net = model.to(device)
         Net.load_state_dict(torch.load(epoch))
 
+        with out:
+            clear_output()
+            print('Image and Model loaded successfully')
+            print('Performing Detection')
+
         ArgmaxMap = vis2.ArgmaxMapOnly(Net, raster, tilesize=tile_size)
         vis2.Argmax2Output(ArgmaxMap, save_as=save_as)
 
-        #Net = model.to(device)
+        # Net = model.to(device)
         del ArgmaxMap
         gc.collect()
         cuda.empty_cache()
-        print('Detection Completed')
-        display(Start)
+
+        with out:
+            clear_output()
+            print('Detection Completed. Result saved in: ', save_as)
+            # display(Start)
 
     Accept.on_click(on_button_clicked)
     row1 = widgets.HBox([Modelbox, Rasterbox])
     row2 = widgets.HBox([Tilebox, Savebox])
-    display(row1, row2, Accept)
+    display(row1, row2, Accept, out)
 
-    Start = widgets.Button(description='Start Detection', disabled=False,
-                           button_style='',  # 'success', 'info', 'warning', 'danger' or ''
-                           tooltip='Click me', icon='eye')
-    Start.on_click(DetectionLoop)
+    # Start = widgets.Button(description='Start Detection', disabled=False,
+    #button_style = '',  # 'success', 'info', 'warning', 'danger' or ''
+    #tooltip = 'Click me', icon = 'eye')
+    # Start.on_click(DetectionLoop)
 
 
-Start.on_click(DetectionLoop)
-display(Start)
+#Start.on_click(DetectionLoop)
+#display(Start)
+DetectionLoop(None) #it does not loop and does not have a Start/Restart button.
