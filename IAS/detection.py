@@ -1,3 +1,7 @@
+# ============================================
+#   FIXED, CLASS-BASED, RESTARTABLE DETECTION UI
+# ============================================
+
 import os
 os.environ["OPENCV_IO_MAX_IMAGE_PIXELS"] = pow(2, 50).__str__()
 import visualisations2 as vis2
@@ -16,158 +20,187 @@ from torch import cuda
 from segmentation_models_pytorch.metrics.functional import accuracy as acc
 import ipywidgets as widgets
 from IPython.display import display
-from IPython.display import clear_output
-out = widgets.Output()
 
+# -------------------------
+# CONFIG  (defaults for mutliclass models)
+# -------------------------
+usable_models_directory = ".\\Models\\_usable\\"
 input_layers_count = 3
 classes_count = 7
-model = None
-usable_models_directory = ".\\Models\\_usable\\"
-
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-"""
-ListBASEModels = ["Unet++"]
-Basebox=widgets.Select(
-    options=ListBASEModels,
-    value=ListBASEModels[0],
-    rows=12,
-    description='Base:',
-    disabled=False
-)
 
-"""
+# -------------------------
+# DETECTION UI CONTROLLER
+# -------------------------
+class DetectionUI:
+    def __init__(self):
+        self.container = widgets.VBox()
+        self.log_output = widgets.Output()
+        self.current_output_widget = None
 
-Start = widgets.Button(description='Start Detection', disabled=False,
-                       button_style='',  # 'success', 'info', 'warning', 'danger' or ''
-                       tooltip='Click me', icon='eye')
+        self.model = None
+        self.Net = None
 
+        display(self.container)
+        self.build_start_ui()
+        
 
-def DetectionLoop(b):
-    with out:
-        clear_output()
-    global Start
-    global usable_models_directory
-    ListModels = os.listdir(usable_models_directory)
-    if len(ListModels) == 0:
-        # Start.close()
-        print("No single class models were found inside the folder ", usable_models_directory)
-        return
+    # -------------------------
+    # LOGGING
+    # -------------------------
+    def log(self, *args, **kwargs):
+        if self.current_output_widget is not None:
+            with self.current_output_widget:
+                print(*args, **kwargs)
+        else:
+            print(*args, **kwargs)
 
-    # Start.close()
+    # -------------------------
+    # UI BUILDERS
+    # -------------------------
+    def build_start_ui(self):
+        """Start button screen."""
+        self.current_output_widget = self.log_output
+        self.log_output.clear_output()
 
-    global input_layers_count
-    global classes_count
-    global model
+        self.Start = widgets.Button(
+            description='Start Detection',
+            icon='eye',
+            tooltip='Click to begin',
+            button_style=''
+        )
+        self.Start.on_click(self.start_detection)
 
-    if model is None:
-        model = smp.UnetPlusPlus(
-            encoder_name="resnet152",  # choose encoder, e.g. mobilenet_v2 or efficientnet-b7
-            encoder_weights="imagenet",  # use None or `imagenet` pre-trained weights for encoder initialization
-            in_channels=input_layers_count,  # model input channels (1 for gray-scale images, 3 for RGB, etc.)
-            classes=classes_count,  # model output channels (number of classes in your dataset, add +1 for background)
-            activation='softmax',  # deprecated for some models.  Last activation is self(x)
+        self.container.children = [self.log_output, self.Start]
+
+    def start_detection(self, b):
+        """Transition to model/raster/tile selection."""
+        self.current_output_widget = self.log_output
+        self.log_output.clear_output()
+
+        # Load available models
+        global classes_count
+        global usable_models_directory
+        if classes_count <= 2:
+            classes_count = 2
+            usable_models_directory = ".\\Models\\_usable_1_class\\"
+        ListModels = os.listdir(usable_models_directory)
+        if len(ListModels) == 0:
+            with self.log_output:
+                print("No single-class models found in:", usable_models_directory)
+            return
+
+        # Build widgets
+        ListRasters = os.listdir(".\\Data\\source\\rasters")
+
+        self.Rasterbox = widgets.Select(
+            options=ListRasters,
+            value=ListRasters[0],
+            rows=12,
+            description='Raster:'
         )
 
-    ListRasters = os.listdir(".\\Data\\source\\rasters")
-    Rasterbox = widgets.Select(
-        options=ListRasters,
-        value=ListRasters[0],
-        rows=12,
-        description='Raster:',
-        disabled=False)
+        self.Modelbox = widgets.Select(
+            options=ListModels,
+            value=ListModels[0],
+            rows=12,
+            description='Model:'
+        )
 
-    ListModels = os.listdir(usable_models_directory)  # checkpoints that are deemed usable for detection
-    Modelbox = widgets.Select(
-        options=ListModels,
-        value=ListModels[0],
-        rows=12,
-        description='Model:',
-        disabled=False)
+        self.Tilebox = widgets.IntText(value=1024, description='Tile Size:')
 
-    Tilebox = widgets.IntText(value=1024, description='Tile Size:', disabled=False)
+        t = datetime.now()
+        DateTime = f"{t.hour}{t.minute}-{t.day}-{t.month}-{t.year}"
+        self.Savebox = widgets.Text(
+            value='detection' + DateTime,
+            description='Save As:'
+        )
 
-    t = datetime.now()
-    DateTime = str(t.hour) + str(t.minute) + "-" + str(t.day) + "-" + str(t.month) + "-" + str(t.year)
-    Savebox = widgets.Text(value='detection' + DateTime, placeholder='detection' + DateTime, description='Save As:',
-                           disabled=False)
+        self.Accept = widgets.Button(
+            description='Accept & Proceed',
+            icon='check',
+            tooltip='Run detection'
+        )
+        self.Accept.on_click(self.run_detection)
 
-    Accept = widgets.Button(description='Accept & Proceed', disabled=False,
-                            button_style='',  # 'success', 'info', 'warning', 'danger' or ''
-                            tooltip='Click me',
-                            icon='check')
+        row1 = widgets.HBox([self.Modelbox, self.Rasterbox])
+        row2 = widgets.HBox([self.Tilebox, self.Savebox])
 
-    def on_button_clicked(b):
+        self.container.children = [self.log_output, row1, row2, self.Accept]
 
-        with out:
-            clear_output()
-            print("Loading data and model...", end=" ")
-        global Net
-        global usable_models_directory
-        tile_size = Tilebox.value
-        file = Rasterbox.value
-        epoch = Modelbox.value
-        epoch = usable_models_directory + epoch
-        save_name = Savebox.value
+    # -------------------------
+    # DETECTION LOGIC
+    # -------------------------
+    def run_detection(self, b):
+        """Hide UI, show log, run detection, then return to Start."""
+        self.current_output_widget = self.log_output
+        self.log_output.clear_output()
+
+        # Extract selections
+        tile_size = self.Tilebox.value
+        raster_file = self.Rasterbox.value
+        epoch_file = self.Modelbox.value
+        epoch_path = usable_models_directory + epoch_file
+        save_name = self.Savebox.value
         save_as = '.\\Results\\' + save_name
-        raster = '.\\Data\\source\\rasters\\' + file
+        raster_path = '.\\Data\\source\\rasters\\' + raster_file
 
-        row1.close()
-        row2.close()
-        Tilebox.close()
-        Accept.close()
+        # Hide UI
+        self.container.children = [self.log_output]
 
-        global model
-        try:  # this is used to detect the model's output size
-            # however, this correction forces a Unet++Resnet152,
-            # so it bugs out if a different model encounters this exception.
-            model.load_state_dict(torch.load(epoch))
+        with self.log_output:
+            print("Loading model and data...")
+
+        # Load model (with auto-detect output classes)
+        if self.model is None:
+            self.model = smp.UnetPlusPlus(
+                encoder_name="resnet152",
+                encoder_weights="imagenet",
+                in_channels=input_layers_count,
+                classes=classes_count,
+                activation='softmax'
+            )
+
+        try:
+            self.model.load_state_dict(torch.load(epoch_path))
         except Exception as error:
-            # handle the exception
-            # print(error)
-            # print (str(error).split("shape torch.Size([")) #.split(",")[0] )
+            # Auto-detect output size
             detect_output_size = int(str(error).split("shape torch.Size([")[1].split(",")[0])
-            global input_layers_count
-            model = smp.UnetPlusPlus(
+            self.model = smp.UnetPlusPlus(
                 encoder_name="resnet152",
                 encoder_weights="imagenet",
                 in_channels=input_layers_count,
                 classes=detect_output_size,
-                activation='softmax')
+                activation='softmax'
+            )
 
-        Net = model.to(device)
-        Net.load_state_dict(torch.load(epoch))
+        self.Net = self.model.to(device)
+        self.Net.load_state_dict(torch.load(epoch_path))
 
-        with out:
-            clear_output()
-            print('Image and Model loaded successfully')
-            print('Performing Detection')
+        with self.log_output:
+            print("Model loaded.")
+            print("Performing detection...")
 
-        ArgmaxMap = vis2.ArgmaxMapOnly(Net, raster, tilesize=tile_size)
+        # Run detection
+        ArgmaxMap = vis2.ArgmaxMapOnly(self.Net, raster_path, tilesize=tile_size)
         vis2.Argmax2Output(ArgmaxMap, save_as=save_as)
 
-        # Net = model.to(device)
-        del ArgmaxMap
+        del ArgmaxMap,self.Net
         gc.collect()
         cuda.empty_cache()
 
-        with out:
-            clear_output()
-            print('Detection Completed. Result saved in: ', save_as)
-            # display(Start)
+        with self.log_output:
+            print("Detection completed.")
+            print("Saved to:", save_as)
 
-    Accept.on_click(on_button_clicked)
-    row1 = widgets.HBox([Modelbox, Rasterbox])
-    row2 = widgets.HBox([Tilebox, Savebox])
-    display(row1, row2, Accept, out)
-
-    # Start = widgets.Button(description='Start Detection', disabled=False,
-    #button_style = '',  # 'success', 'info', 'warning', 'danger' or ''
-    #tooltip = 'Click me', icon = 'eye')
-    # Start.on_click(DetectionLoop)
+        # Reset UI
+        self.build_start_ui()
 
 
-#Start.on_click(DetectionLoop)
-#display(Start)
-DetectionLoop(None) #it does not loop and does not have a Start/Restart button.
+# -------------------------
+# RUN UI
+# -------------------------
+
+#DetectionUI()
