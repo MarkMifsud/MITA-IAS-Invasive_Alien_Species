@@ -61,85 +61,169 @@ def train(TrainFolder, ValidFolder, epochs, batchSize, TestFolder=TestFolder, Le
 
     return
 
-ListFolders=[]
+# --- logging to an Output widget, shared for this UI ---
+current_output_widget = None
+
+def log(*args, **kwargs):
+    if current_output_widget is not None:
+        with current_output_widget:
+            print(*args, **kwargs)
+    else:
+        print(*args, **kwargs)
+
+
+# --- discover folders as before ---
+ListFolders = []
 for file in os.listdir(".\\Data\\trainData\\"):
     d = os.path.join(".\\Data\\trainData\\", file)
     if os.path.isdir(d):
         ListFolders.append(file)
 
-Trainbox = widgets.Select(
-    options=ListFolders,
-    value=ListFolders[0],
-    rows=12,
-    description='Train:',
-    disabled=False)
+# --- persistent container + log widget ---
+container = widgets.VBox()
+log_output = widgets.Output()
 
-Validbox = widgets.Select(
-    options=ListFolders,
-    value=ListFolders[1],
-    rows=12,
-    description='Validation:',
-    disabled=False)
+# --- globals for widgets so we can rebuild UIs ---
+Trainbox = None
+Validbox = None
+Batchbox = None
+InChannelsBox = None
+OutChannelsBox = None
+EpochsBox = None
+Accept = None
+SingleClassBox = None
+AcceptClass = None
 
-batch_size =int((torch.cuda.get_device_properties(0).total_memory/804896768)/8)*8
-Batchbox=widgets.IntText(value=batch_size, description='Batch Size:', disabled=False)
 
-InChannelsBox=widgets.IntText(value=3, description='In Channels:', disabled=False)
-OutChannelsBox=widgets.IntText(value=7, description='Out Channels:', disabled=False)
-EpochsBox=widgets.IntText(value=300, description='Epochs:', disabled=False)
+def build_main_ui():
+    """Build the main training UI (train/valid/batch/epochs/etc)."""
+    global Trainbox, Validbox, Batchbox, InChannelsBox, OutChannelsBox, EpochsBox, Accept
 
-EpochsBox=widgets.IntText(value=300, description='Epochs:', disabled=False)
+    # main widgets
+    Trainbox = widgets.Select(
+        options=ListFolders,
+        value=ListFolders[0] if len(ListFolders) > 0 else None,
+        rows=12,
+        description='Train:',
+        disabled=False
+    )
 
-Accept = widgets.Button(description='Accept', disabled=False,
-    button_style='',  # 'success', 'info', 'warning', 'danger' or ''
-    tooltip='Click me',
-    icon='check')
+    Validbox = widgets.Select(
+        options=ListFolders,
+        value=ListFolders[1] if len(ListFolders) > 1 else None,
+        rows=12,
+        description='Validation:',
+        disabled=False
+    )
+
+    batch_size = int((torch.cuda.get_device_properties(0).total_memory / 804896768) / 8) * 8
+    Batchbox = widgets.IntText(value=batch_size, description='Batch Size:', disabled=False)
+
+    InChannelsBox = widgets.IntText(value=3, description='In Channels:', disabled=False)
+    OutChannelsBox = widgets.IntText(value=7, description='Out Channels:', disabled=False)
+    EpochsBox = widgets.IntText(value=300, description='Epochs:', disabled=False)
+
+    Accept = widgets.Button(
+        description='Accept',
+        disabled=False,
+        button_style='',
+        tooltip='Start training',
+        icon='check'
+    )
+
+    row0 = widgets.HBox([InChannelsBox, OutChannelsBox])
+    row1 = widgets.HBox([Trainbox, Validbox])
+    row2 = widgets.HBox([Batchbox, EpochsBox])
+
+    # layout: log + main UI
+    container.children = [log_output, row0, row1, row2, Accept]
+
+    Accept.on_click(on_button_clicked)
+
+
+def show_single_class_ui():
+    """Show the single-class selection UI, hiding the main UI."""
+    global SingleClassBox, AcceptClass
+
+    SingleClassBox = widgets.IntText(value=10, description='Class:', disabled=False)
+    AcceptClass = widgets.Button(
+        description='Accept',
+        disabled=False,
+        button_style='',
+        tooltip='Train single class',
+        icon='check'
+    )
+
+    # hide main UI, show log + single-class UI
+    container.children = [log_output, SingleClassBox, AcceptClass]
+
+    AcceptClass.on_click(on_class_accept)
+
+
+def restore_main_ui():
+    """Rebuild and show the main UI again (log persists)."""
+    log_output.clear_output()
+    build_main_ui()
+
 
 def on_button_clicked(b):
-    epochs=EpochsBox.value
-    batch_size=Batchbox.value
+    """Main Accept button: start training or go to single-class UI."""
+    global input_channels, output_channels, current_output_widget
 
-    TrainFolder=Trainbox.value
-    TrainFolder="./Data/trainData/"+TrainFolder
-    ValidFolder=Validbox.value
-    ValidFolder="./Data/trainData/"+ValidFolder
+    epochs = EpochsBox.value
+    batch_size = Batchbox.value
 
-    global input_channels
-    global output_channels
-    output_channels=OutChannelsBox.value
-    input_channels=InChannelsBox.value
-    row0.close()
-    row1.close()
-    row2.close()
-    Accept.close()
+    TrainFolder = "./Data/trainData/" + Trainbox.value
+    ValidFolder = "./Data/trainData/" + Validbox.value
+
+    output_channels = OutChannelsBox.value
+    input_channels = InChannelsBox.value
+
+    # route logs to our log_output
+    current_output_widget = log_output
 
     if output_channels <= 2:
+        # single-class mode: set to 2 and ask which class
         output_channels = 2
-        AcceptClass = widgets.Button(description='Accept', disabled=False,
-                                button_style='',  # 'success', 'info', 'warning', 'danger' or ''
-                                tooltip='Click me',
-                                icon='check')
-        SingleClassBox =widgets.IntText(value=10, description='Class:', disabled=False)
+        show_single_class_ui()
+    else:
+        # hide main UI, keep log visible
+        container.children = [log_output]
 
-        def on_class_accept(b):
-            st.singleclass =SingleClassBox.value
-            SingleClassBox.close()
-            AcceptClass.close()
-            print("training only on class: ", st.singleclass, end=" " )
-            print(epochs, "epochs on:", TrainFolder, ValidFolder, "Batch size:",batch_size)
+        with log_output:
+            log(f"{epochs} epochs on: {TrainFolder} (train), {ValidFolder} (valid), Batch size: {batch_size}")
             train(TrainFolder, ValidFolder, epochs, batch_size)
 
-        AcceptClass.on_click(on_class_accept)
-        display(SingleClassBox, AcceptClass)
+        # after training, restore main UI
+        restore_main_ui()
 
 
-    else:
-        print(epochs, "epochs on:", TrainFolder, ValidFolder, "Batch size:",batch_size)
+def on_class_accept(b):
+    """Accept button for single-class training."""
+    global current_output_widget
+
+    epochs = EpochsBox.value
+    batch_size = Batchbox.value
+
+    TrainFolder = "./Data/trainData/" + Trainbox.value
+    ValidFolder = "./Data/trainData/" + Validbox.value
+
+    current_output_widget = log_output
+
+    with log_output:
+        st.singleclass = SingleClassBox.value
+        log(f"Training only on class: {st.singleclass}")
+        log(f"{epochs} epochs on: {TrainFolder} (train), {ValidFolder} (valid), Batch size: {batch_size}")
+
+        # hide single-class UI, keep log visible
+        container.children = [log_output]
+
         train(TrainFolder, ValidFolder, epochs, batch_size)
 
-Accept.on_click(on_button_clicked)
+    # after training, restore main UI (single-class UI can be shown again on next run)
+    restore_main_ui()
 
-row0=widgets.HBox([InChannelsBox , OutChannelsBox])
-row1=widgets.HBox([ Trainbox, Validbox])
-row2=widgets.HBox([Batchbox, EpochsBox])
-display(row0, row1, row2, Accept)
+
+# --- initial display ---
+build_main_ui()
+display(container)
