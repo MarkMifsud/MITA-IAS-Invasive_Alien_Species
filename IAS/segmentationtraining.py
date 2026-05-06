@@ -14,6 +14,8 @@ import torch
 import torchvision.transforms as tf
 import segmentation_models_pytorch as smp
 from segmentation_models_pytorch.metrics.functional import accuracy as acc
+import warnings
+warnings.filterwarnings("ignore")
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
