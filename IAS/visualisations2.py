@@ -17,6 +17,8 @@ from datetime import datetime
 import numpy as np
 #from PIL import Image 
 #import matplotlib.pyplot as plt 
+import warnings
+warnings.filterwarnings("ignore")
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -285,25 +287,22 @@ def ArgmaxMapOnly(Net, image_file_path, tilesize=1600, save_name=None):
 
 
 def Pred2Result(Pred, Lbl, save_as ):
+    # Always generate class names dynamically
+
     global classes_count
-    class_names = ('None', 'Arundo', 'Opuntia', 'Agri', 'Eucalyp', 'Agave', 'Acacia')
-    global single_class_mode
-    if single_class_mode is True:
-        class_names = ('None', 'Class')
+    # First class is always "None"
+    class_names = ["None"]
+
+    # If single-class mode is enabled, force 2 classes: None + Class1
+    if single_class_mode:
         classes_count = 2
 
-    if classes_count == 8:
-        class_names = ('None', 'Arundo', 'Opuntia', 'Agri', 'Eucalyp', 'Agave', 'Acacia', 'Prinjol')
+    # Generate Class1, Class2, ..., Class{classes_count-1}
+    for i in range(1, classes_count):
+        class_names.append(f"Class{i}")
 
-    if classes_count > 8:
-        print(
-            "Number of species beyond that planned originally, if this part of the app crashes contact the programmer")
-        class_names_list = list(class_names)
-        remaining = classes_count - 8
-        for r in range(remaining + 1):
-            class_names_list.append('Class' + str(r))
-        class_names = tuple(class_names_list)
-
+    # Convert to tuple if needed
+    class_names = tuple(class_names)
 
     conf_matrix=torch.zeros([classes_count , classes_count])
 

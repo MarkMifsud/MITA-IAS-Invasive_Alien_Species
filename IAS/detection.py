@@ -63,7 +63,7 @@ class DetectionUI:
     def build_start_ui(self):
         """Start button screen."""
         self.current_output_widget = self.log_output
-        self.log_output.clear_output()
+        #self.log_output.clear_output()
 
         self.Start = widgets.Button(
             description='Start Detection',
@@ -192,8 +192,9 @@ class DetectionUI:
         cuda.empty_cache()
 
         with self.log_output:
+            clear_output()
             print("Detection completed.")
-            print("Saved to:", save_as)
+            print("Saved to: ", save_as)
 
         # Reset UI
         self.build_start_ui()

@@ -14,6 +14,8 @@ import torch
 import torchvision.transforms as tf
 import segmentation_models_pytorch as smp
 from segmentation_models_pytorch.metrics.functional import accuracy as acc
+import warnings
+warnings.filterwarnings("ignore")
 
 import segmentationtraining as st
 
@@ -221,7 +223,7 @@ def on_class_accept(b):
         train(TrainFolder, ValidFolder, epochs, batch_size)
 
     # after training, restore main UI (single-class UI can be shown again on next run)
-    restore_main_ui()
+    #restore_main_ui()
 
 
 # --- initial display ---
